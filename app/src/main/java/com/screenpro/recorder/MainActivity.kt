@@ -36,9 +36,14 @@ class MainActivity : Activity() {
 
     private var pendingStart = false
     private var recording = false
+    private var recordingPaused = false
     private var receiverRegistered = false
     private var stopRequested = false
     private var timerRunning = false
+    private var timerPaused = false
+
+    // Elapsed recording time preserved while the timer is paused.
+    private var elapsedBeforePause = 0L
 
     private val receiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -48,7 +53,12 @@ class MainActivity : Activity() {
                     false
                 )
 
-                setRecording(isActive)
+                val isPaused = intent.getBooleanExtra(
+                    RecordingService.EXTRA_IS_PAUSED,
+                    false
+                )
+
+                setRecording(isActive, isPaused)
             }
         }
     }
@@ -59,13 +69,8 @@ class MainActivity : Activity() {
         projectionManager =
             getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
 
-        recording = getSharedPreferences(
-            "screenpro",
-            MODE_PRIVATE
-        ).getBoolean("recording", false)
-
         createUi()
-        setRecording(recording)
+        setRecording(false, false)
         updateRecordingCount()
     }
 
@@ -91,12 +96,6 @@ class MainActivity : Activity() {
             receiverRegistered = true
         }
 
-        val savedState = getSharedPreferences(
-            "screenpro",
-            MODE_PRIVATE
-        ).getBoolean("recording", recording)
-
-        setRecording(savedState)
         updateRecordingCount()
     }
 
@@ -283,6 +282,7 @@ class MainActivity : Activity() {
             setTextColor(Color.WHITE)
             gravity = Gravity.CENTER
             setPadding(0, dp(24), 0, dp(4))
+            base = SystemClock.elapsedRealtime()
         }
 
         statusCard.addView(timer)
@@ -784,9 +784,14 @@ class MainActivity : Activity() {
 
     // RECORDING STATE AND TIMER
 
-    private fun setRecording(active: Boolean) {
+    private fun setRecording(
+        active: Boolean,
+        paused: Boolean
+    ) {
         val wasRecording = recording
+
         recording = active
+        recordingPaused = active && paused
 
         if (!::startButton.isInitialized) return
 
@@ -801,16 +806,46 @@ class MainActivity : Activity() {
                 status.text = "Stopping recording…"
                 readyBadge.text = "SAVING"
                 stopButton.isEnabled = false
+            } else if (paused) {
+                status.text = "Ⅱ Recording paused"
+                readyBadge.text = "PAUSED"
+                stopButton.isEnabled = true
             } else {
                 status.text = "● Recording in progress"
                 readyBadge.text = "RECORDING"
                 stopButton.isEnabled = true
             }
 
-            if (!wasRecording && !timerRunning) {
+            if (!wasRecording) {
+                // New recording: start the timer from zero.
+                elapsedBeforePause = 0L
                 timer.base = SystemClock.elapsedRealtime()
-                timer.start()
-                timerRunning = true
+                timer.stop()
+                timerRunning = false
+                timerPaused = false
+            }
+
+            if (paused) {
+                // Freeze the timer and preserve its elapsed time.
+                if (!timerPaused) {
+                    elapsedBeforePause =
+                        (SystemClock.elapsedRealtime() - timer.base)
+                            .coerceAtLeast(0L)
+
+                    timer.stop()
+                    timerRunning = false
+                    timerPaused = true
+                }
+            } else {
+                // Resume from the previously preserved elapsed time.
+                if (timerPaused || !timerRunning) {
+                    timer.base =
+                        SystemClock.elapsedRealtime() - elapsedBeforePause
+
+                    timer.start()
+                    timerRunning = true
+                    timerPaused = false
+                }
             }
         } else {
             stopRequested = false
@@ -819,11 +854,13 @@ class MainActivity : Activity() {
             status.text = "Ready when you are"
             readyBadge.text = "READY"
 
-            if (timerRunning || wasRecording) {
-                timer.stop()
-                timerRunning = false
-                timer.text = "00:00"
-            }
+            timer.stop()
+            timer.base = SystemClock.elapsedRealtime()
+            timer.text = "00:00"
+
+            timerRunning = false
+            timerPaused = false
+            elapsedBeforePause = 0L
 
             updateRecordingCount()
         }
@@ -841,7 +878,13 @@ class MainActivity : Activity() {
             return
         }
 
+        val microphoneEnabled = getSharedPreferences(
+            "screenpro",
+            MODE_PRIVATE
+        ).getBoolean("microphone_enabled", true)
+
         if (
+            microphoneEnabled &&
             checkSelfPermission(Manifest.permission.RECORD_AUDIO) !=
             PackageManager.PERMISSION_GRANTED
         ) {
@@ -896,7 +939,7 @@ class MainActivity : Activity() {
 
                 Toast.makeText(
                     this,
-                    "Microphone permission is required for audio recording.",
+                    "Microphone permission was not granted.",
                     Toast.LENGTH_LONG
                 ).show()
             }
