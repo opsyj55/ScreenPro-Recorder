@@ -1,3 +1,4 @@
+
 name: ScreenPro Recorder Android Build
 
 on:
@@ -29,7 +30,7 @@ jobs:
           gradle-version: '8.9'
 
       - name: Build Android APK
-        run: gradle --no-daemon assembleDebug
+        run: gradle --no-daemon assembleDebug --stacktrace --info
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
