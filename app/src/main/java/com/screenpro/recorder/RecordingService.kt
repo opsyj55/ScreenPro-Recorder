@@ -1,5 +1,7 @@
+
 package com.screenpro.recorder
 
+import android.Manifest
 import android.app.Activity
 import android.app.Notification
 import android.app.NotificationChannel
@@ -9,6 +11,7 @@ import android.app.Service
 import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
@@ -54,6 +57,14 @@ class RecordingService : Service() {
     private var isStopping = false
 
     private lateinit var projectionManager: MediaProjectionManager
+    private val mainHandler = Handler(Looper.getMainLooper())
+
+    private val projectionCallback = object : MediaProjection.Callback() {
+        override fun onStop() {
+            stopRecording()
+            stopSelf()
+        }
+    }
 
     override fun onCreate() {
         super.onCreate()
@@ -72,13 +83,15 @@ class RecordingService : Service() {
     ): Int {
 
         when (intent?.action) {
-
             ACTION_START -> {
-                val resultCode =
-                    intent.getIntExtra(
-                        EXTRA_RESULT_CODE,
-                        Activity.RESULT_CANCELED
-                    )
+                if (isRecording) {
+                    return START_NOT_STICKY
+                }
+
+                val resultCode = intent.getIntExtra(
+                    EXTRA_RESULT_CODE,
+                    Activity.RESULT_CANCELED
+                )
 
                 val resultData: Intent? =
                     if (Build.VERSION.SDK_INT >= 33) {
@@ -91,15 +104,27 @@ class RecordingService : Service() {
                         intent.getParcelableExtra(EXTRA_RESULT_DATA)
                     }
 
-                if (resultData == null ||
-                    resultCode != Activity.RESULT_OK
-                ) {
+                if (resultCode != Activity.RESULT_OK || resultData == null) {
                     stopSelf()
                     return START_NOT_STICKY
                 }
 
-                startRecordingForeground()
-                startRecording(resultCode, resultData)
+                if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) !=
+                    PackageManager.PERMISSION_GRANTED
+                ) {
+                    sendRecordingState(false)
+                    stopSelf()
+                    return START_NOT_STICKY
+                }
+
+                try {
+                    startRecordingForeground()
+                    startRecording(resultCode, resultData)
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                    stopRecording()
+                    stopSelf()
+                }
             }
 
             ACTION_STOP -> {
@@ -114,11 +139,11 @@ class RecordingService : Service() {
     private fun startRecordingForeground() {
         val notification = buildNotification()
 
-        if (Build.VERSION.SDK_INT >= 29) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             var serviceType =
                 ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
 
-            if (Build.VERSION.SDK_INT >= 30) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                 serviceType =
                     serviceType or
                     ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
@@ -164,7 +189,7 @@ class RecordingService : Service() {
                 put(MediaStore.Video.Media.DISPLAY_NAME, filename)
                 put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
 
-                if (Build.VERSION.SDK_INT >= 29) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                     put(
                         MediaStore.Video.Media.RELATIVE_PATH,
                         "Movies/ScreenPro"
@@ -176,14 +201,14 @@ class RecordingService : Service() {
             outputUri = contentResolver.insert(
                 MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
                 contentValues
-            ) ?: throw Exception("Could not create video file")
+            ) ?: throw IllegalStateException("Could not create video file")
 
             outputDescriptor =
                 contentResolver.openFileDescriptor(outputUri!!, "w")
-                    ?: throw Exception("Could not open video file")
+                    ?: throw IllegalStateException("Could not open video file")
 
             mediaRecorder =
-                if (Build.VERSION.SDK_INT >= 31) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                     MediaRecorder(this)
                 } else {
                     @Suppress("DEPRECATION")
@@ -193,6 +218,7 @@ class RecordingService : Service() {
             mediaRecorder?.apply {
                 setAudioSource(MediaRecorder.AudioSource.MIC)
                 setVideoSource(MediaRecorder.VideoSource.SURFACE)
+
                 setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
                 setVideoEncoder(MediaRecorder.VideoEncoder.H264)
                 setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
@@ -208,33 +234,26 @@ class RecordingService : Service() {
                 prepare()
             }
 
-            mediaProjection =
-                projectionManager.getMediaProjection(
-                    resultCode,
-                    resultData
-                ) ?: throw Exception("Could not start screen capture")
+            mediaProjection = projectionManager.getMediaProjection(
+                resultCode,
+                resultData
+            ) ?: throw IllegalStateException("Could not start screen capture")
 
             mediaProjection?.registerCallback(
-                object : MediaProjection.Callback() {
-                    override fun onStop() {
-                        stopRecording()
-                        stopSelf()
-                    }
-                },
-                Handler(Looper.getMainLooper())
+                projectionCallback,
+                mainHandler
             )
 
-            virtualDisplay =
-                mediaProjection?.createVirtualDisplay(
-                    "ScreenProRecorder",
-                    width,
-                    height,
-                    density,
-                    DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-                    mediaRecorder?.surface,
-                    null,
-                    null
-                ) ?: throw Exception("Could not create virtual display")
+            virtualDisplay = mediaProjection?.createVirtualDisplay(
+                "ScreenProRecorder",
+                width,
+                height,
+                density,
+                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                mediaRecorder?.surface,
+                null,
+                mainHandler
+            ) ?: throw IllegalStateException("Could not create virtual display")
 
             mediaRecorder?.start()
 
@@ -277,17 +296,19 @@ class RecordingService : Service() {
 
         try {
             mediaRecorder?.reset()
+        } catch (_: Exception) {
+        }
+
+        try {
             mediaRecorder?.release()
-        } catch (e: Exception) {
-            e.printStackTrace()
+        } catch (_: Exception) {
         }
 
         mediaRecorder = null
 
         try {
             virtualDisplay?.release()
-        } catch (e: Exception) {
-            e.printStackTrace()
+        } catch (_: Exception) {
         }
 
         virtualDisplay = null
@@ -296,22 +317,25 @@ class RecordingService : Service() {
         mediaProjection = null
 
         try {
+            projection?.unregisterCallback(projectionCallback)
+        } catch (_: Exception) {
+        }
+
+        try {
             projection?.stop()
-        } catch (e: Exception) {
-            e.printStackTrace()
+        } catch (_: Exception) {
         }
 
         try {
             outputDescriptor?.close()
-        } catch (e: Exception) {
-            e.printStackTrace()
+        } catch (_: Exception) {
         }
 
         outputDescriptor = null
 
         outputUri?.let { uri ->
             if (successfullySaved) {
-                if (Build.VERSION.SDK_INT >= 29) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                     val values = ContentValues().apply {
                         put(MediaStore.Video.Media.IS_PENDING, 0)
                     }
@@ -378,7 +402,5 @@ class RecordingService : Service() {
         super.onDestroy()
     }
 
-    override fun onBind(intent: Intent?): IBinder? {
-        return null
-    }
+    override fun onBind(intent: Intent?): IBinder? = null
 }
