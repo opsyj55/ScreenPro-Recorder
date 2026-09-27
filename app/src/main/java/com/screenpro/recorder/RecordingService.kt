@@ -1,176 +1,364 @@
+
 package com.screenpro.recorder
 
-import android.app.Notification
-import android.app.NotificationChannel
-import android.app.NotificationManager
-import android.app.PendingIntent
-import android.app.Service
-import android.content.Intent
+import android.app.*
+import android.content.*
 import android.content.pm.ServiceInfo
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
 import android.media.MediaRecorder
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
-import android.os.Build
-import android.os.IBinder
+import android.net.Uri
+import android.os.*
+import android.provider.MediaStore
 import android.util.DisplayMetrics
 import android.view.WindowManager
-import androidx.core.app.NotificationCompat
-import java.io.FileOutputStream
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 class RecordingService : Service() {
+
     companion object {
         const val ACTION_START = "com.screenpro.recorder.START"
         const val ACTION_STOP = "com.screenpro.recorder.STOP"
+
         const val EXTRA_RESULT_CODE = "result_code"
         const val EXTRA_RESULT_DATA = "result_data"
+
+        private const val NOTIFICATION_ID = 1001
         private const val CHANNEL_ID = "screenpro_recording"
-        private const val NOTIFICATION_ID = 4102
     }
 
-    private var projection: MediaProjection? = null
-    private var recorder: MediaRecorder? = null
-    private var display: VirtualDisplay? = null
-    private var output: RecordingStore.Output? = null
+    private var mediaRecorder: MediaRecorder? = null
+    private var mediaProjection: MediaProjection? = null
+    private var virtualDisplay: VirtualDisplay? = null
+    private var outputUri: Uri? = null
+    private var outputDescriptor: ParcelFileDescriptor? = null
+
     private var isRecording = false
 
-    override fun onBind(intent: Intent?): IBinder? = null
+    private lateinit var projectionManager: MediaProjectionManager
 
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+    override fun onCreate() {
+        super.onCreate()
+
+        projectionManager =
+            getSystemService(Context.MEDIA_PROJECTION_SERVICE)
+                    as MediaProjectionManager
+
+        createNotificationChannel()
+    }
+
+    override fun onStartCommand(
+        intent: Intent?,
+        flags: Int,
+        startId: Int
+    ): Int {
+
         when (intent?.action) {
-            ACTION_STOP -> stopRecording()
+
             ACTION_START -> {
-                val notification = buildNotification("Preparing screen recording")
-                if (Build.VERSION.SDK_INT >= 29) {
-                    startForeground(NOTIFICATION_ID, notification,
-                        ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION or
-                            ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
-                } else startForeground(NOTIFICATION_ID, notification)
-                beginCapture(intent)
+                val resultCode =
+                    intent.getIntExtra(EXTRA_RESULT_CODE, Activity.RESULT_CANCELED)
+
+                val resultData =
+                    if (Build.VERSION.SDK_INT >= 33) {
+                        intent.getParcelableExtra(
+                            EXTRA_RESULT_DATA,
+                            Intent::class.java
+                        )
+                    } else {
+                        @Suppress("DEPRECATION")
+                        intent.getParcelableExtra(EXTRA_RESULT_DATA)
+                    }
+
+                if (resultData == null ||
+                    resultCode != Activity.RESULT_OK
+                ) {
+                    stopSelf()
+                    return START_NOT_STICKY
+                }
+
+                startRecordingForeground()
+                startRecording(resultCode, resultData)
+            }
+
+            ACTION_STOP -> {
+                stopRecording()
+                stopSelf()
             }
         }
+
         return START_NOT_STICKY
     }
 
-    private fun beginCapture(intent: Intent) {
+    private fun startRecordingForeground() {
+
+        val notification = buildNotification()
+
+        if (Build.VERSION.SDK_INT >= 29) {
+
+            var serviceType =
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+
+            if (Build.VERSION.SDK_INT >= 30) {
+                serviceType =
+                    serviceType or
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+            }
+
+            startForeground(
+                NOTIFICATION_ID,
+                notification,
+                serviceType
+            )
+
+        } else {
+            startForeground(NOTIFICATION_ID, notification)
+        }
+    }
+
+    private fun startRecording(
+        resultCode: Int,
+        resultData: Intent
+    ) {
+
         try {
-            val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, 0)
+            val metrics = DisplayMetrics()
+
             @Suppress("DEPRECATION")
-            val data = if (Build.VERSION.SDK_INT >= 33)
-                intent.getParcelableExtra(EXTRA_RESULT_DATA, Intent::class.java)
-            else intent.getParcelableExtra(EXTRA_RESULT_DATA)
-            if (data == null) throw IllegalStateException("Missing screen capture permission data")
+            val windowManager =
+                getSystemService(Context.WINDOW_SERVICE) as WindowManager
 
-            val manager = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-            projection = manager.getMediaProjection(resultCode, data)
-            val metrics = getScreenMetrics()
-            output = RecordingStore.create(this)
+            @Suppress("DEPRECATION")
+            windowManager.defaultDisplay.getRealMetrics(metrics)
 
-            val mediaRecorder = if (Build.VERSION.SDK_INT >= 31) MediaRecorder(this) else @Suppress("DEPRECATION") MediaRecorder()
-            recorder = mediaRecorder
-            mediaRecorder.apply {
-                setAudioSource(MediaRecorder.AudioSource.MIC)
-                setVideoSource(MediaRecorder.VideoSource.SURFACE)
-                setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
-                setVideoEncoder(MediaRecorder.VideoEncoder.H264)
-                setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
-                setVideoSize(metrics.width, metrics.height)
-                setVideoFrameRate(30)
-                setVideoEncodingBitRate(6_000_000)
-                setAudioEncodingBitRate(128_000)
-                setAudioSamplingRate(44100)
-                val out = output!!
-                if (out.uri != null) {
-                    val descriptor = contentResolver.openFileDescriptor(out.uri, "w")
-                        ?: throw IllegalStateException("Could not open output video")
-                    setOutputFile(descriptor.fileDescriptor)
-                    // Keep the descriptor alive until recorder stops.
-                    outputDescriptor = descriptor
-                } else {
-                    setOutputFile(out.file!!.absolutePath)
+            val width = metrics.widthPixels
+            val height = metrics.heightPixels
+            val density = metrics.densityDpi
+
+            val filename = "ScreenPro_" +
+                SimpleDateFormat(
+                    "yyyyMMdd_HHmmss",
+                    Locale.US
+                ).format(Date()) + ".mp4"
+
+            val contentValues = ContentValues().apply {
+                put(MediaStore.Video.Media.DISPLAY_NAME, filename)
+                put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+
+                if (Build.VERSION.SDK_INT >= 29) {
+                    put(
+                        MediaStore.Video.Media.RELATIVE_PATH,
+                        "Movies/ScreenPro"
+                    )
+                    put(MediaStore.Video.Media.IS_PENDING, 1)
                 }
+            }
+
+            outputUri = contentResolver.insert(
+                MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
+                contentValues
+            ) ?: throw Exception("Could not create video file")
+
+            outputDescriptor =
+                contentResolver.openFileDescriptor(outputUri!!, "w")
+                    ?: throw Exception("Could not open video file")
+
+            mediaRecorder =
+                if (Build.VERSION.SDK_INT >= 31) {
+                    MediaRecorder(this)
+                } else {
+                    @Suppress("DEPRECATION")
+                    MediaRecorder()
+                }
+
+            mediaRecorder?.apply {
+
+                setAudioSource(MediaRecorder.AudioSource.MIC)
+
+                setVideoSource(MediaRecorder.VideoSource.SURFACE)
+
+                setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
+
+                setVideoEncoder(MediaRecorder.VideoEncoder.H264)
+
+                setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
+
+                setVideoSize(width, height)
+
+                setVideoFrameRate(30)
+
+                setVideoEncodingBitRate(5_000_000)
+
+                setAudioEncodingBitRate(128_000)
+
+                setAudioSamplingRate(44100)
+
+                setOutputFile(outputDescriptor!!.fileDescriptor)
+
                 prepare()
             }
 
-            display = projection!!.createVirtualDisplay(
-                "ScreenProCapture", metrics.width, metrics.height, metrics.densityDpi,
-                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-                mediaRecorder.surface, null, null
+            mediaProjection =
+                projectionManager.getMediaProjection(
+                    resultCode,
+                    resultData
+                )
+
+            mediaProjection?.registerCallback(
+                object : MediaProjection.Callback() {
+                    override fun onStop() {
+                        stopRecording()
+                        stopSelf()
+                    }
+                },
+                Handler(Looper.getMainLooper())
             )
-            mediaRecorder.start()
+
+            virtualDisplay =
+                mediaProjection?.createVirtualDisplay(
+                    "ScreenProRecorder",
+                    width,
+                    height,
+                    density,
+                    DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                    mediaRecorder?.surface,
+                    null,
+                    null
+                )
+
+            mediaRecorder?.start()
+
             isRecording = true
-            updateNotification("ScreenPro is recording")
+
         } catch (e: Exception) {
-            updateNotification("Recording failed: ${e.message ?: "unknown error"}")
+            e.printStackTrace()
             stopRecording()
-        }
-    }
-
-    private var outputDescriptor: android.os.ParcelFileDescriptor? = null
-
-    private fun getScreenMetrics(): Metrics {
-        val wm = getSystemService(WINDOW_SERVICE) as WindowManager
-        val metrics = DisplayMetrics()
-        @Suppress("DEPRECATION")
-        wm.defaultDisplay.getRealMetrics(metrics)
-        return Metrics(metrics.widthPixels, metrics.heightPixels, metrics.densityDpi)
-    }
-
-    private data class Metrics(val width: Int, val height: Int, val densityDpi: Int)
-
-    private fun buildNotification(text: String): Notification {
-        val manager = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
-        if (Build.VERSION.SDK_INT >= 26) {
-            manager.createNotificationChannel(NotificationChannel(
-                CHANNEL_ID, "Screen recording", NotificationManager.IMPORTANCE_LOW
-            ))
-        }
-        val stopIntent = Intent(this, RecordingService::class.java).setAction(ACTION_STOP)
-        val stopPending = PendingIntent.getService(this, 2, stopIntent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
-        val openIntent = PendingIntent.getActivity(this, 1, Intent(this, MainActivity::class.java),
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
-        return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setSmallIcon(android.R.drawable.presence_video_online)
-            .setContentTitle("ScreenPro Recorder")
-            .setContentText(text)
-            .setContentIntent(openIntent)
-            .setOngoing(isRecording)
-            .addAction(android.R.drawable.ic_media_pause, "Stop", stopPending)
-            .setPriority(NotificationCompat.PRIORITY_LOW)
-            .build()
-    }
-
-    private fun updateNotification(text: String) {
-        val manager = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
-        manager.notify(NOTIFICATION_ID, buildNotification(text))
-    }
-
-    private fun stopRecording() {
-        try {
-            if (isRecording) recorder?.stop()
-        } catch (_: RuntimeException) {
-            output?.let { RecordingStore.delete(this, it) }
-        } finally {
-            isRecording = false
-            try { display?.release() } catch (_: Exception) {}
-            display = null
-            try { recorder?.reset(); recorder?.release() } catch (_: Exception) {}
-            recorder = null
-            try { projection?.stop() } catch (_: Exception) {}
-            projection = null
-            try { outputDescriptor?.close() } catch (_: Exception) {}
-            outputDescriptor = null
-            output?.let { try { RecordingStore.publish(this, it) } catch (_: Exception) {} }
-            output = null
-            stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
         }
     }
 
+    private fun stopRecording() {
+
+        if (!isRecording && mediaRecorder == null) {
+            return
+        }
+
+        var successfullySaved = false
+
+        try {
+            mediaRecorder?.stop()
+            successfullySaved = true
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+
+        isRecording = false
+
+        try {
+            mediaRecorder?.reset()
+            mediaRecorder?.release()
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+
+        mediaRecorder = null
+
+        virtualDisplay?.release()
+        virtualDisplay = null
+
+        val projection = mediaProjection
+        mediaProjection = null
+
+        try {
+            projection?.stop()
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+
+        try {
+            outputDescriptor?.close()
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+
+        outputDescriptor = null
+
+        outputUri?.let { uri ->
+
+            if (successfullySaved) {
+
+                if (Build.VERSION.SDK_INT >= 29) {
+                    val values = ContentValues().apply {
+                        put(MediaStore.Video.Media.IS_PENDING, 0)
+                    }
+
+                    contentResolver.update(uri, values, null, null)
+                }
+
+            } else {
+                contentResolver.delete(uri, null, null)
+            }
+        }
+
+        outputUri = null
+    }
+
+    private fun buildNotification(): Notification {
+
+        val stopIntent = Intent(this, RecordingService::class.java).apply {
+            action = ACTION_STOP
+        }
+
+        val stopPendingIntent = PendingIntent.getService(
+            this,
+            1002,
+            stopIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or
+                    PendingIntent.FLAG_IMMUTABLE
+        )
+
+        return Notification.Builder(this, CHANNEL_ID)
+            .setContentTitle("ScreenPro Recorder")
+            .setContentText("Your screen is being recorded")
+            .setSmallIcon(android.R.drawable.presence_video_online)
+            .setOngoing(true)
+            .addAction(
+                android.R.drawable.ic_media_pause,
+                "Stop Recording",
+                stopPendingIntent
+            )
+            .build()
+    }
+
+    private fun createNotificationChannel() {
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+
+            val channel = NotificationChannel(
+                CHANNEL_ID,
+                "ScreenPro Recording",
+                NotificationManager.IMPORTANCE_LOW
+            ).apply {
+                description = "Screen recording controls"
+            }
+
+            val manager =
+                getSystemService(NotificationManager::class.java)
+
+            manager.createNotificationChannel(channel)
+        }
+    }
+
     override fun onDestroy() {
-        if (isRecording) stopRecording()
+        stopRecording()
         super.onDestroy()
+    }
+
+    override fun onBind(intent: Intent?): IBinder? {
+        return null
     }
 }
