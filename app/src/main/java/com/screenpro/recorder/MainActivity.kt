@@ -1,10 +1,12 @@
-
 package com.screenpro.recorder
 
 import android.Manifest
 import android.app.Activity
 import android.app.AlertDialog
-import android.content.*
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.Typeface
@@ -15,7 +17,12 @@ import android.os.Bundle
 import android.os.SystemClock
 import android.view.Gravity
 import android.view.View
-import android.widget.*
+import android.widget.Button
+import android.widget.Chronometer
+import android.widget.LinearLayout
+import android.widget.ScrollView
+import android.widget.TextView
+import android.widget.Toast
 
 class MainActivity : Activity() {
 
@@ -25,20 +32,23 @@ class MainActivity : Activity() {
     private lateinit var startButton: Button
     private lateinit var stopButton: Button
     private lateinit var recordingsCount: TextView
+    private lateinit var readyBadge: TextView
 
     private var pendingStart = false
     private var recording = false
     private var receiverRegistered = false
+    private var stopRequested = false
+    private var timerRunning = false
 
     private val receiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             if (intent?.action == RecordingService.ACTION_STATE_CHANGED) {
-                setRecording(
-                    intent.getBooleanExtra(
-                        RecordingService.EXTRA_IS_RECORDING,
-                        false
-                    )
+                val isActive = intent.getBooleanExtra(
+                    RecordingService.EXTRA_IS_RECORDING,
+                    false
                 )
+
+                setRecording(isActive)
             }
         }
     }
@@ -63,22 +73,30 @@ class MainActivity : Activity() {
         super.onResume()
 
         if (!receiverRegistered) {
-            val filter = IntentFilter(RecordingService.ACTION_STATE_CHANGED)
+            val filter = IntentFilter(
+                RecordingService.ACTION_STATE_CHANGED
+            )
 
             if (Build.VERSION.SDK_INT >= 33) {
-                registerReceiver(receiver, filter, RECEIVER_NOT_EXPORTED)
+                registerReceiver(
+                    receiver,
+                    filter,
+                    RECEIVER_NOT_EXPORTED
+                )
             } else {
+                @Suppress("DEPRECATION")
                 registerReceiver(receiver, filter)
             }
 
             receiverRegistered = true
         }
 
-        setRecording(
-            getSharedPreferences("screenpro", MODE_PRIVATE)
-                .getBoolean("recording", recording)
-        )
+        val savedState = getSharedPreferences(
+            "screenpro",
+            MODE_PRIVATE
+        ).getBoolean("recording", recording)
 
+        setRecording(savedState)
         updateRecordingCount()
     }
 
@@ -88,6 +106,7 @@ class MainActivity : Activity() {
                 unregisterReceiver(receiver)
             } catch (_: Exception) {
             }
+
             receiverRegistered = false
         }
 
@@ -101,62 +120,106 @@ class MainActivity : Activity() {
         }
 
         val scroll = ScrollView(this)
+
         val page = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(20), dp(20), dp(20), dp(28))
+
+            // Extra top padding moves the header down from the status bar.
+            setPadding(
+                dp(20),
+                dp(34),
+                dp(20),
+                dp(28)
+            )
         }
 
         scroll.addView(page)
 
         // TOP BAR
+
         val header = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
         }
 
-        val logo = label("▶", 25, Color.WHITE, true).apply {
+        // Smaller ScreenPro logo
+        val logo = label(
+            "▶",
+            21,
+            Color.WHITE,
+            true
+        ).apply {
             gravity = Gravity.CENTER
-            background = rounded(0xFFE52F45.toInt(), 17)
-            elevation = dp(3).toFloat()
-            layoutParams = LinearLayout.LayoutParams(dp(52), dp(52))
+            background = rounded(0xFFE52F45.toInt(), 14)
+            elevation = dp(2).toFloat()
+
+            layoutParams = LinearLayout.LayoutParams(
+                dp(44),
+                dp(44)
+            )
         }
 
         header.addView(logo)
 
         val brand = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(12), 0, 0, 0)
+            setPadding(dp(11), 0, 0, 0)
         }
 
-        brand.addView(label("ScreenPro", 23, 0xFF172033.toInt(), true))
-        brand.addView(label("SCREEN RECORDER", 10, 0xFF7A8497.toInt(), true))
+        brand.addView(
+            label(
+                "ScreenPro",
+                22,
+                0xFF172033.toInt(),
+                true
+            )
+        )
+
+        brand.addView(
+            label(
+                "SCREEN RECORDER",
+                10,
+                0xFF7A8497.toInt(),
+                true
+            )
+        )
 
         header.addView(
             brand,
             LinearLayout.LayoutParams(0, -2, 1f)
         )
 
+        // Smaller menu button
         val menuButton = TextView(this).apply {
             text = "☰"
-            textSize = 25f
+            textSize = 22f
             gravity = Gravity.CENTER
             setTextColor(0xFF172033.toInt())
-            background = rounded(Color.WHITE, 15)
+            background = rounded(Color.WHITE, 14)
             elevation = dp(2).toFloat()
-            layoutParams = LinearLayout.LayoutParams(dp(48), dp(48))
-            setOnClickListener { showAppMenu() }
+
+            layoutParams = LinearLayout.LayoutParams(
+                dp(44),
+                dp(44)
+            )
+
+            setOnClickListener {
+                showAppMenu()
+            }
         }
 
         header.addView(menuButton)
         page.addView(header)
 
-        // GREETING / INTRO
+        // GREETING
+
         val intro = label(
             "Your screen. Your story.",
             27,
             0xFF172033.toInt(),
             true
         )
+
         intro.setPadding(0, dp(28), 0, dp(6))
         page.addView(intro)
 
@@ -169,10 +232,16 @@ class MainActivity : Activity() {
             )
         )
 
-        // RECORDING STATUS WIDGET
+        // RECORDING STATUS CARD
+
         val statusCard = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(20), dp(20), dp(20), dp(20))
+            setPadding(
+                dp(20),
+                dp(20),
+                dp(20),
+                dp(20)
+            )
             background = rounded(0xFF172033.toInt(), 24)
             elevation = dp(4).toFloat()
         }
@@ -183,13 +252,28 @@ class MainActivity : Activity() {
         }
 
         statusHeader.addView(
-            label("●  RECORDING STUDIO", 12, 0xFFBFC8D8.toInt(), true),
+            label(
+                "●  RECORDING STUDIO",
+                12,
+                0xFFBFC8D8.toInt(),
+                true
+            ),
             LinearLayout.LayoutParams(0, -2, 1f)
         )
 
-        val readyBadge = label("READY", 10, 0xFF198754.toInt(), true).apply {
+        readyBadge = label(
+            "READY",
+            10,
+            0xFF198754.toInt(),
+            true
+        ).apply {
             gravity = Gravity.CENTER
-            setPadding(dp(12), dp(7), dp(12), dp(7))
+            setPadding(
+                dp(12),
+                dp(7),
+                dp(12),
+                dp(7)
+            )
             background = rounded(0xFFE3F5EB.toInt(), 30)
         }
 
@@ -219,12 +303,15 @@ class MainActivity : Activity() {
 
         statusCard.addView(status)
 
+        // START BUTTON
+
         startButton = Button(this).apply {
             text = "●   START RECORDING"
             textSize = 15f
             isAllCaps = false
             setTextColor(Color.WHITE)
             background = rounded(0xFFE52F45.toInt(), 16)
+
             setOnClickListener {
                 requestPermissionsAndCapture()
             }
@@ -235,6 +322,8 @@ class MainActivity : Activity() {
             LinearLayout.LayoutParams(-1, dp(58))
         )
 
+        // STOP BUTTON
+
         stopButton = Button(this).apply {
             text = "■   STOP RECORDING"
             textSize = 15f
@@ -242,19 +331,42 @@ class MainActivity : Activity() {
             setTextColor(Color.WHITE)
             background = rounded(0xFF344158.toInt(), 16)
             visibility = View.GONE
-            setOnClickListener {
-                startService(
-                    Intent(
-                        this@MainActivity,
-                        RecordingService::class.java
-                    ).setAction(RecordingService.ACTION_STOP)
-                )
 
-                Toast.makeText(
+            setOnClickListener {
+                if (stopRequested) return@setOnClickListener
+
+                stopRequested = true
+                isEnabled = false
+                status.text = "Stopping recording…"
+                readyBadge.text = "SAVING"
+
+                val stopIntent = Intent(
                     this@MainActivity,
-                    "Stopping recording…",
-                    Toast.LENGTH_SHORT
-                ).show()
+                    RecordingService::class.java
+                ).apply {
+                    action = RecordingService.ACTION_STOP
+                }
+
+                try {
+                    startService(stopIntent)
+
+                    Toast.makeText(
+                        this@MainActivity,
+                        "Stopping recording…",
+                        Toast.LENGTH_SHORT
+                    ).show()
+                } catch (e: Exception) {
+                    stopRequested = false
+                    isEnabled = true
+                    status.text = "Could not stop recording. Please try again."
+                    readyBadge.text = "RECORDING"
+
+                    Toast.makeText(
+                        this@MainActivity,
+                        "Unable to send stop command.",
+                        Toast.LENGTH_LONG
+                    ).show()
+                }
             }
         }
 
@@ -272,9 +384,15 @@ class MainActivity : Activity() {
             }
         )
 
-        // QUICK FEATURE WIDGETS
+        // QUICK FEATURES
+
         page.addView(
-            label("Quick features", 19, 0xFF172033.toInt(), true).apply {
+            label(
+                "Quick features",
+                19,
+                0xFF172033.toInt(),
+                true
+            ).apply {
                 setPadding(0, dp(27), 0, dp(13))
             }
         )
@@ -284,14 +402,22 @@ class MainActivity : Activity() {
         }
 
         featureRow.addView(
-            featureCard("🎙", "Microphone", "Audio capture"),
+            featureCard(
+                "🎙",
+                "Microphone",
+                "Audio capture"
+            ),
             LinearLayout.LayoutParams(0, dp(112), 1f).apply {
                 rightMargin = dp(7)
             }
         )
 
         featureRow.addView(
-            featureCard("▣", "HD Video", "Screen capture"),
+            featureCard(
+                "▣",
+                "HD Video",
+                "Screen capture"
+            ),
             LinearLayout.LayoutParams(0, dp(112), 1f).apply {
                 leftMargin = dp(7)
             }
@@ -299,7 +425,8 @@ class MainActivity : Activity() {
 
         page.addView(featureRow)
 
-        // RECORDINGS LIBRARY
+        // RECORDINGS HEADER
+
         val libraryHeader = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -307,31 +434,62 @@ class MainActivity : Activity() {
         }
 
         libraryHeader.addView(
-            label("My recordings", 19, 0xFF172033.toInt(), true),
+            label(
+                "My recordings",
+                19,
+                0xFF172033.toInt(),
+                true
+            ),
             LinearLayout.LayoutParams(0, -2, 1f)
         )
 
         libraryHeader.addView(
-            label("VIEW ALL  ›", 12, 0xFFE52F45.toInt(), true).apply {
-                setOnClickListener { showRecordings() }
+            label(
+                "VIEW ALL  ›",
+                12,
+                0xFFE52F45.toInt(),
+                true
+            ).apply {
+                setOnClickListener {
+                    showRecordings()
+                }
             }
         )
 
         page.addView(libraryHeader)
 
+        // RECORDINGS CARD
+
         val libraryCard = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(16), dp(16), dp(16), dp(16))
+            setPadding(
+                dp(16),
+                dp(16),
+                dp(16),
+                dp(16)
+            )
             background = rounded(Color.WHITE, 19)
             elevation = dp(2).toFloat()
-            setOnClickListener { showRecordings() }
+
+            setOnClickListener {
+                showRecordings()
+            }
         }
 
-        val libraryIcon = label("▶", 22, 0xFFE52F45.toInt(), true).apply {
+        val libraryIcon = label(
+            "▶",
+            22,
+            0xFFE52F45.toInt(),
+            true
+        ).apply {
             gravity = Gravity.CENTER
             background = rounded(0xFFFFEDF0.toInt(), 15)
-            layoutParams = LinearLayout.LayoutParams(dp(52), dp(52))
+
+            layoutParams = LinearLayout.LayoutParams(
+                dp(52),
+                dp(52)
+            )
         }
 
         libraryCard.addView(libraryIcon)
@@ -342,7 +500,12 @@ class MainActivity : Activity() {
         }
 
         libraryText.addView(
-            label("Recorded videos", 15, 0xFF172033.toInt(), true)
+            label(
+                "Recorded videos",
+                15,
+                0xFF172033.toInt(),
+                true
+            )
         )
 
         recordingsCount = label(
@@ -360,7 +523,12 @@ class MainActivity : Activity() {
         )
 
         libraryCard.addView(
-            label("›", 28, 0xFF7A8497.toInt(), false)
+            label(
+                "›",
+                28,
+                0xFF7A8497.toInt(),
+                false
+            )
         )
 
         page.addView(libraryCard)
@@ -377,9 +545,15 @@ class MainActivity : Activity() {
             }
         )
 
-        root.addView(scroll, LinearLayout.LayoutParams(-1, -1))
+        root.addView(
+            scroll,
+            LinearLayout.LayoutParams(-1, -1)
+        )
+
         setContentView(root)
     }
+
+    // QUICK FEATURE CARD
 
     private fun featureCard(
         icon: String,
@@ -389,21 +563,49 @@ class MainActivity : Activity() {
         val card = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(15), dp(12), dp(12), dp(12))
+            setPadding(
+                dp(15),
+                dp(12),
+                dp(12),
+                dp(12)
+            )
             background = rounded(Color.WHITE, 18)
             elevation = dp(2).toFloat()
         }
 
-        card.addView(label(icon, 24, 0xFFE52F45.toInt(), true))
         card.addView(
-            label(title, 14, 0xFF172033.toInt(), true).apply {
+            label(
+                icon,
+                24,
+                0xFFE52F45.toInt(),
+                true
+            )
+        )
+
+        card.addView(
+            label(
+                title,
+                14,
+                0xFF172033.toInt(),
+                true
+            ).apply {
                 setPadding(0, dp(5), 0, dp(2))
             }
         )
-        card.addView(label(subtitle, 11, 0xFF7A8497.toInt(), false))
+
+        card.addView(
+            label(
+                subtitle,
+                11,
+                0xFF7A8497.toInt(),
+                false
+            )
+        )
 
         return card
     }
+
+    // APP MENU
 
     private fun showAppMenu() {
         val options = arrayOf(
@@ -452,6 +654,8 @@ class MainActivity : Activity() {
             .show()
     }
 
+    // RECORDINGS COUNT
+
     private fun updateRecordingCount() {
         if (!::recordingsCount.isInitialized) return
 
@@ -461,45 +665,85 @@ class MainActivity : Activity() {
             0
         }
 
-        recordingsCount.text =
-            if (count == 1) "1 saved video"
-            else "$count saved videos"
+        recordingsCount.text = when (count) {
+            0 -> "No saved videos yet"
+            1 -> "1 saved video"
+            else -> "$count saved videos"
+        }
     }
 
+    // RECORDING STATE AND TIMER
+
     private fun setRecording(active: Boolean) {
+        val wasRecording = recording
         recording = active
 
         if (!::startButton.isInitialized) return
 
-        startButton.visibility = if (active) View.GONE else View.VISIBLE
-        stopButton.visibility = if (active) View.VISIBLE else View.GONE
+        startButton.visibility =
+            if (active) View.GONE else View.VISIBLE
 
-        status.text = if (active) {
-            "● Recording in progress"
-        } else {
-            "Ready when you are"
-        }
+        stopButton.visibility =
+            if (active) View.VISIBLE else View.GONE
 
         if (active) {
-            timer.base = SystemClock.elapsedRealtime()
-            timer.start()
+            if (stopRequested) {
+                status.text = "Stopping recording…"
+                readyBadge.text = "SAVING"
+                stopButton.isEnabled = false
+            } else {
+                status.text = "● Recording in progress"
+                readyBadge.text = "RECORDING"
+                stopButton.isEnabled = true
+            }
+
+            // Start timer only on the transition from stopped to recording.
+            // Repeated active broadcasts will not reset it.
+            if (!wasRecording && !timerRunning) {
+                timer.base = SystemClock.elapsedRealtime()
+                timer.start()
+                timerRunning = true
+            }
         } else {
-            timer.stop()
-            timer.text = "00:00"
+            stopRequested = false
+            stopButton.isEnabled = true
+
+            status.text = "Ready when you are"
+            readyBadge.text = "READY"
+
+            if (timerRunning || wasRecording) {
+                timer.stop()
+                timerRunning = false
+                timer.text = "00:00"
+            }
+
             updateRecordingCount()
         }
     }
 
+    // PERMISSIONS AND SCREEN CAPTURE
+
     private fun requestPermissionsAndCapture() {
+        if (recording) {
+            Toast.makeText(
+                this,
+                "A recording is already active.",
+                Toast.LENGTH_SHORT
+            ).show()
+            return
+        }
+
         if (
             checkSelfPermission(Manifest.permission.RECORD_AUDIO) !=
             PackageManager.PERMISSION_GRANTED
         ) {
             pendingStart = true
+
             requestPermissions(
                 arrayOf(Manifest.permission.RECORD_AUDIO),
                 1002
             )
+
             return
         }
 
@@ -525,7 +769,11 @@ class MainActivity : Activity() {
         permissions: Array<out String>,
         results: IntArray
     ) {
-        super.onRequestPermissionsResult(requestCode, permissions, results)
+        super.onRequestPermissionsResult(
+            requestCode,
+            permissions,
+            results
+        )
 
         if (requestCode == 1002) {
             if (
@@ -537,6 +785,7 @@ class MainActivity : Activity() {
                 requestPermissionsAndCapture()
             } else {
                 pendingStart = false
+
                 Toast.makeText(
                     this,
                     "Microphone permission is required for audio recording.",
@@ -552,35 +801,67 @@ class MainActivity : Activity() {
         resultCode: Int,
         data: Intent?
     ) {
-        super.onActivityResult(requestCode, resultCode, data)
+        super.onActivityResult(
+            requestCode,
+            resultCode,
+            data
+        )
 
         if (requestCode != 1001) return
 
         if (resultCode == RESULT_OK && data != null) {
-            val service = Intent(this, RecordingService::class.java).apply {
-                action = RecordingService.ACTION_START
-                putExtra(RecordingService.EXTRA_RESULT_CODE, resultCode)
-                putExtra(RecordingService.EXTRA_RESULT_DATA, data)
-            }
+            stopRequested = false
 
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                startForegroundService(service)
-            } else {
-                startService(service)
-            }
-
-            Toast.makeText(
+            val service = Intent(
                 this,
-                "ScreenPro is starting…",
-                Toast.LENGTH_SHORT
-            ).show()
+                RecordingService::class.java
+            ).apply {
+                action = RecordingService.ACTION_START
+
+                putExtra(
+                    RecordingService.EXTRA_RESULT_CODE,
+                    resultCode
+                )
+
+                putExtra(
+                    RecordingService.EXTRA_RESULT_DATA,
+                    data
+                )
+            }
+
+            try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    startForegroundService(service)
+                } else {
+                    startService(service)
+                }
+
+                Toast.makeText(
+                    this,
+                    "ScreenPro is starting…",
+                    Toast.LENGTH_SHORT
+                ).show()
+            } catch (e: Exception) {
+                status.text = "Could not start recording."
+                Toast.makeText(
+                    this,
+                    "Unable to start the recording service.",
+                    Toast.LENGTH_LONG
+                ).show()
+            }
         } else {
             status.text = "Screen capture permission was not granted."
         }
     }
 
+    // RECORDINGS LIBRARY
+
     private fun showRecordings() {
-        val items = RecordingStore.list(this)
+        val items = try {
+            RecordingStore.list(this)
+        } catch (_: Exception) {
+            emptyList()
+        }
 
         if (items.isEmpty()) {
             AlertDialog.Builder(this)
@@ -590,20 +871,27 @@ class MainActivity : Activity() {
                 )
                 .setPositiveButton("OK", null)
                 .show()
+
             return
         }
 
         val names = items.mapIndexed { index, uri ->
             "Recording ${items.size - index}  •  " +
-            (uri.lastPathSegment ?: "Video file")
+                (uri.lastPathSegment ?: "Video file")
         }.toTypedArray()
 
         AlertDialog.Builder(this)
             .setTitle("Your recordings")
             .setItems(names) { _, which ->
                 val play = Intent(Intent.ACTION_VIEW).apply {
-                    setDataAndType(items[which], "video/mp4")
-                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    setDataAndType(
+                        items[which],
+                        "video/mp4"
+                    )
+
+                    addFlags(
+                        Intent.FLAG_GRANT_READ_URI_PERMISSION
+                    )
                 }
 
                 try {
@@ -620,28 +908,38 @@ class MainActivity : Activity() {
             .show()
     }
 
+    // UI HELPERS
+
     private fun label(
         value: String,
         size: Int,
         color: Int,
         bold: Boolean
-    ) = TextView(this).apply {
-        text = value
-        textSize = size.toFloat()
-        setTextColor(color)
+    ): TextView {
+        return TextView(this).apply {
+            text = value
+            textSize = size.toFloat()
+            setTextColor(color)
 
-        if (bold) {
-            typeface = Typeface.DEFAULT_BOLD
+            if (bold) {
+                typeface = Typeface.DEFAULT_BOLD
+            }
         }
     }
 
-    private fun rounded(color: Int, radius: Int) =
-        GradientDrawable().apply {
+    private fun rounded(
+        color: Int,
+        radius: Int
+    ): GradientDrawable {
+        return GradientDrawable().apply {
             setColor(color)
             cornerRadius = dp(radius).toFloat()
         }
+    }
 
     private fun dp(value: Int): Int {
-        return (value * resources.displayMetrics.density).toInt()
+        return (
+            value * resources.displayMetrics.density
+        ).toInt()
     }
 }
