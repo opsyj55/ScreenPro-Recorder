@@ -1,0 +1,32 @@
+
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="48dp"
+    android:height="48dp"
+    android:viewportWidth="48"
+    android:viewportHeight="48">
+
+    <!-- Dark rounded background -->
+    <path
+        android:fillColor="#101827"
+        android:pathData="M10,2 L38,2 Q46,2 46,10 L46,38 Q46,46 38,46 L10,46 Q2,46 2,38 L2,10 Q2,2 10,2 Z" />
+
+    <!-- Screen outline -->
+    <path
+        android:fillColor="#26364F"
+        android:pathData="M11,10 L37,10 Q40,10 40,13 L40,30 Q40,33 37,33 L11,33 Q8,33 8,30 L8,13 Q8,10 11,10 Z" />
+
+    <!-- Screen display -->
+    <path
+        android:fillColor="#101827"
+        android:pathData="M11,13 L37,13 L37,30 L11,30 Z" />
+
+    <!-- Screen stand -->
+    <path
+        android:fillColor="#DCE7F5"
+        android:pathData="M22,33 L26,33 L26,37 L22,37 Z M17,37 L31,37 L31,40 L17,40 Z" />
+
+    <!-- Recording indicator -->
+    <path
+        android:fillColor="#FF4D5A"
+        android:pathData="M30,17 A5,5 0,1 0,30 27 A5,5 0,1 0,30 17 Z" />
+</vector>
