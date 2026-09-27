@@ -86,12 +86,12 @@ class RecordingService : Service() {
     private lateinit var projectionManager: MediaProjectionManager
 
     private val mainHandler = Handler(Looper.getMainLooper())
-
     private val timerHandler = Handler(Looper.getMainLooper())
 
+    // Timer does not update while recording is paused.
     private val timerRunnable = object : Runnable {
         override fun run() {
-            if (!isRecording || isStopping) return
+            if (!isRecording || isPaused || isStopping) return
 
             updateRecordingTimer()
             timerHandler.postDelayed(this, 1000)
@@ -584,7 +584,9 @@ class RecordingService : Service() {
 
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+
                 if (isPaused) {
+                    // RESUME RECORDING
                     recorder.resume()
 
                     isPaused = false
@@ -592,19 +594,30 @@ class RecordingService : Service() {
 
                     pauseButton?.text = "Ⅱ"
 
+                    // Restart timer updates
+                    timerHandler.removeCallbacks(timerRunnable)
+                    timerHandler.post(timerRunnable)
+
                     Toast.makeText(
                         this,
                         "Recording resumed",
                         Toast.LENGTH_SHORT
                     ).show()
-                } else {
-                    recorder.pause()
 
+                } else {
+                    // PAUSE RECORDING
                     accumulatedRecordingTime +=
                         SystemClock.elapsedRealtime() - recordingStartTime
 
+                    recorder.pause()
+
                     isPaused = true
                     pauseButton?.text = "▶"
+
+                    // Stop timer updates while paused
+                    timerHandler.removeCallbacks(timerRunnable)
+
+                    updateRecordingTimer()
 
                     Toast.makeText(
                         this,
@@ -613,7 +626,6 @@ class RecordingService : Service() {
                     ).show()
                 }
 
-                updateRecordingTimer()
                 sendRecordingState(true)
 
             } else {
