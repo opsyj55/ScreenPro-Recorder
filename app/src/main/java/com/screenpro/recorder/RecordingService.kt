@@ -5,7 +5,6 @@ import android.app.Activity
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
-import android.app.PendingIntent
 import android.app.Service
 import android.content.ContentValues
 import android.content.Context
@@ -26,9 +25,7 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.ParcelFileDescriptor
-import android.os.SystemClock
 import android.provider.MediaStore
-import android.util.DisplayMetrics
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
@@ -70,33 +67,18 @@ class RecordingService : Service() {
     private var foregroundStarted = false
 
     private var windowManager: WindowManager? = null
-    private var floatingWidget: View? = null
+    private var floatingWidget: LinearLayout? = null
     private var pauseButton: Button? = null
-    private var timerText: TextView? = null
     private var widgetParams: WindowManager.LayoutParams? = null
+    private var widgetCollapsed = false
 
     private var initialTouchX = 0f
     private var initialTouchY = 0f
     private var initialWidgetX = 0
     private var initialWidgetY = 0
 
-    private var recordingStartTime = 0L
-    private var accumulatedRecordingTime = 0L
-
     private lateinit var projectionManager: MediaProjectionManager
-
     private val mainHandler = Handler(Looper.getMainLooper())
-    private val timerHandler = Handler(Looper.getMainLooper())
-
-    // Timer does not update while recording is paused.
-    private val timerRunnable = object : Runnable {
-        override fun run() {
-            if (!isRecording || isPaused || isStopping) return
-
-            updateRecordingTimer()
-            timerHandler.postDelayed(this, 1000)
-        }
-    }
 
     private val projectionCallback = object : MediaProjection.Callback() {
         override fun onStop() {
@@ -123,7 +105,6 @@ class RecordingService : Service() {
         flags: Int,
         startId: Int
     ): Int {
-
         when (intent?.action) {
             ACTION_START -> handleStart(intent)
 
@@ -224,7 +205,6 @@ class RecordingService : Service() {
     ) {
         isStopping = false
         isPaused = false
-        accumulatedRecordingTime = 0L
 
         val prefs = getSharedPreferences(
             "screenpro",
@@ -241,7 +221,7 @@ class RecordingService : Service() {
             "HD"
         ) ?: "HD"
 
-        val metrics = DisplayMetrics()
+        val metrics = android.util.DisplayMetrics()
 
         @Suppress("DEPRECATION")
         val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
@@ -304,7 +284,6 @@ class RecordingService : Service() {
             }
 
             setVideoSource(MediaRecorder.VideoSource.SURFACE)
-
             setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
             setVideoEncoder(MediaRecorder.VideoEncoder.H264)
 
@@ -354,14 +333,7 @@ class RecordingService : Service() {
         isRecording = true
         isPaused = false
 
-        recordingStartTime = SystemClock.elapsedRealtime()
-        accumulatedRecordingTime = 0L
-
         showFloatingWidget()
-
-        timerHandler.removeCallbacks(timerRunnable)
-        timerHandler.post(timerRunnable)
-
         sendRecordingState(true)
     }
 
@@ -370,8 +342,10 @@ class RecordingService : Service() {
         screenHeight: Int,
         quality: String
     ): Pair<Int, Int> {
-
-        val longer = maxOf(screenWidth, screenHeight).toFloat()
+        val longer = maxOf(
+            screenWidth,
+            screenHeight
+        ).toFloat()
 
         val targetLongSide = when (quality) {
             "Standard" -> 1280f
@@ -405,7 +379,7 @@ class RecordingService : Service() {
         sendBroadcast(stateIntent)
     }
 
-    // FLOATING SIDEBAR
+    // FLOATING WIDGET
 
     private fun showFloatingWidget() {
         if (!isRecording || floatingWidget != null) return
@@ -426,71 +400,10 @@ class RecordingService : Service() {
             val panel = LinearLayout(this).apply {
                 orientation = LinearLayout.VERTICAL
                 gravity = Gravity.CENTER
-                setPadding(dp(7), dp(9), dp(7), dp(9))
+                setPadding(dp(8), dp(10), dp(8), dp(10))
                 background = rounded(0xEE172033.toInt(), 18)
                 elevation = dp(8).toFloat()
             }
-
-            val dragHandle = TextView(this).apply {
-                text = "⠿"
-                textSize = 22f
-                gravity = Gravity.CENTER
-                setTextColor(Color.WHITE)
-                setPadding(dp(4), dp(2), dp(4), dp(5))
-            }
-
-            panel.addView(
-                dragHandle,
-                LinearLayout.LayoutParams(dp(54), dp(35))
-            )
-
-            timerText = TextView(this).apply {
-                text = "00:00"
-                textSize = 12f
-                gravity = Gravity.CENTER
-                setTextColor(Color.WHITE)
-                setPadding(dp(2), dp(2), dp(2), dp(8))
-            }
-
-            panel.addView(
-                timerText,
-                LinearLayout.LayoutParams(dp(58), dp(28))
-            )
-
-            pauseButton = Button(this).apply {
-                text = "Ⅱ"
-                textSize = 19f
-                isAllCaps = false
-                setTextColor(Color.WHITE)
-                background = rounded(0xFF344158.toInt(), 12)
-                setOnClickListener {
-                    togglePause()
-                }
-            }
-
-            panel.addView(
-                pauseButton,
-                LinearLayout.LayoutParams(dp(54), dp(46)).apply {
-                    bottomMargin = dp(7)
-                }
-            )
-
-            val stopButton = Button(this).apply {
-                text = "■"
-                textSize = 19f
-                isAllCaps = false
-                setTextColor(Color.WHITE)
-                background = rounded(0xFFE52F45.toInt(), 12)
-                setOnClickListener {
-                    finishRecording()
-                    stopSelf()
-                }
-            }
-
-            panel.addView(
-                stopButton,
-                LinearLayout.LayoutParams(dp(54), dp(46))
-            )
 
             val type =
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -509,72 +422,232 @@ class RecordingService : Service() {
                 PixelFormat.TRANSLUCENT
             ).apply {
                 gravity = Gravity.END or Gravity.CENTER_VERTICAL
-                x = dp(8)
+                x = dp(12)
                 y = 0
             }
 
-            val dragListener = View.OnTouchListener { _, event ->
-                when (event.action) {
-                    MotionEvent.ACTION_DOWN -> {
-                        initialTouchX = event.rawX
-                        initialTouchY = event.rawY
-                        initialWidgetX = params.x
-                        initialWidgetY = params.y
-                        true
-                    }
-
-                    MotionEvent.ACTION_MOVE -> {
-                        params.x = initialWidgetX -
-                            (event.rawX - initialTouchX).toInt()
-
-                        params.y = initialWidgetY +
-                            (event.rawY - initialTouchY).toInt()
-
-                        try {
-                            windowManager?.updateViewLayout(panel, params)
-                        } catch (_: Exception) {
-                        }
-
-                        true
-                    }
-
-                    MotionEvent.ACTION_UP -> true
-                    else -> false
-                }
-            }
-
-            dragHandle.setOnTouchListener(dragListener)
-
-            windowManager?.addView(panel, params)
-
             floatingWidget = panel
             widgetParams = params
+            widgetCollapsed = false
 
-            updateRecordingTimer()
+            buildExpandedWidget(panel)
+            windowManager?.addView(panel, params)
 
         } catch (e: Exception) {
             e.printStackTrace()
+            floatingWidget = null
+            widgetParams = null
         }
     }
 
-    private fun updateRecordingTimer() {
-        val elapsed = if (isPaused) {
-            accumulatedRecordingTime
-        } else {
-            accumulatedRecordingTime +
-                (SystemClock.elapsedRealtime() - recordingStartTime)
+    private fun buildExpandedWidget(panel: LinearLayout) {
+        panel.removeAllViews()
+        panel.orientation = LinearLayout.VERTICAL
+        panel.gravity = Gravity.CENTER
+        panel.setPadding(dp(8), dp(10), dp(8), dp(10))
+        panel.background = rounded(0xEE172033.toInt(), 18)
+
+        val header = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
         }
 
-        val totalSeconds = elapsed / 1000
-        val minutes = totalSeconds / 60
-        val seconds = totalSeconds % 60
+        val dragHandle = TextView(this).apply {
+            text = "⋮⋮"
+            textSize = 17f
+            gravity = Gravity.CENTER
+            setTextColor(Color.WHITE)
+            setPadding(dp(5), dp(2), dp(5), dp(8))
+        }
 
-        timerText?.text = String.format(
-            Locale.US,
-            "%02d:%02d",
-            minutes,
-            seconds
+        header.addView(
+            dragHandle,
+            LinearLayout.LayoutParams(0, -2, 1f)
         )
+
+        val collapseButton = TextView(this).apply {
+            text = "—"
+            textSize = 22f
+            gravity = Gravity.CENTER
+            setTextColor(Color.WHITE)
+            setPadding(dp(8), 0, dp(8), dp(8))
+            setOnClickListener {
+                collapseWidget()
+            }
+        }
+
+        header.addView(collapseButton)
+        panel.addView(header)
+
+        pauseButton = Button(this).apply {
+            text = if (isPaused) "▶" else "Ⅱ"
+            textSize = 19f
+            isAllCaps = false
+            setTextColor(Color.WHITE)
+            background = rounded(0xFF344158.toInt(), 12)
+            setOnClickListener {
+                togglePause()
+            }
+        }
+
+        panel.addView(
+            pauseButton,
+            LinearLayout.LayoutParams(dp(54), dp(48)).apply {
+                bottomMargin = dp(7)
+            }
+        )
+
+        val stopButton = Button(this).apply {
+            text = "■"
+            textSize = 19f
+            isAllCaps = false
+            setTextColor(Color.WHITE)
+            background = rounded(0xFFE52F45.toInt(), 12)
+            setOnClickListener {
+                finishRecording()
+                stopSelf()
+            }
+        }
+
+        panel.addView(
+            stopButton,
+            LinearLayout.LayoutParams(dp(54), dp(48))
+        )
+
+        val params = widgetParams
+        if (params != null) {
+            dragHandle.setOnTouchListener(
+                createDragListener(panel, params)
+            )
+        }
+
+        widgetCollapsed = false
+        updateWidgetLayout()
+    }
+
+    private fun collapseWidget() {
+        val panel = floatingWidget ?: return
+        val params = widgetParams ?: return
+
+        panel.removeAllViews()
+        panel.orientation = LinearLayout.HORIZONTAL
+        panel.gravity = Gravity.CENTER
+        panel.setPadding(0, 0, 0, 0)
+        panel.background = rounded(0xEE172033.toInt(), 18)
+
+        val tab = TextView(this).apply {
+            text = "●"
+            textSize = 22f
+            gravity = Gravity.CENTER
+            setTextColor(Color.WHITE)
+            background = rounded(0xEE172033.toInt(), 18)
+            setPadding(dp(12), dp(12), dp(12), dp(12))
+        }
+
+        tab.setOnTouchListener { view, event ->
+            when (event.action) {
+                MotionEvent.ACTION_DOWN -> {
+                    initialTouchX = event.rawX
+                    initialTouchY = event.rawY
+                    initialWidgetX = params.x
+                    initialWidgetY = params.y
+                    view.tag = false
+                    true
+                }
+
+                MotionEvent.ACTION_MOVE -> {
+                    val deltaX = event.rawX - initialTouchX
+                    val deltaY = event.rawY - initialTouchY
+
+                    if (
+                        kotlin.math.abs(deltaX) > dp(5) ||
+                        kotlin.math.abs(deltaY) > dp(5)
+                    ) {
+                        view.tag = true
+                    }
+
+                    params.x = initialWidgetX - deltaX.toInt()
+                    params.y = initialWidgetY + deltaY.toInt()
+
+                    try {
+                        windowManager?.updateViewLayout(panel, params)
+                    } catch (_: Exception) {
+                    }
+
+                    true
+                }
+
+                MotionEvent.ACTION_UP -> {
+                    val wasDragged = view.tag as? Boolean ?: false
+
+                    if (!wasDragged) {
+                        expandWidget()
+                    }
+
+                    true
+                }
+
+                MotionEvent.ACTION_CANCEL -> true
+                else -> false
+            }
+        }
+
+        panel.addView(
+            tab,
+            LinearLayout.LayoutParams(dp(52), dp(52))
+        )
+
+        widgetCollapsed = true
+        updateWidgetLayout()
+    }
+
+    private fun expandWidget() {
+        val panel = floatingWidget ?: return
+        buildExpandedWidget(panel)
+    }
+
+    private fun createDragListener(
+        panel: LinearLayout,
+        params: WindowManager.LayoutParams
+    ): View.OnTouchListener {
+        return View.OnTouchListener { _, event ->
+            when (event.action) {
+                MotionEvent.ACTION_DOWN -> {
+                    initialTouchX = event.rawX
+                    initialTouchY = event.rawY
+                    initialWidgetX = params.x
+                    initialWidgetY = params.y
+                    true
+                }
+
+                MotionEvent.ACTION_MOVE -> {
+                    params.x = initialWidgetX -
+                        (event.rawX - initialTouchX).toInt()
+
+                    params.y = initialWidgetY +
+                        (event.rawY - initialTouchY).toInt()
+
+                    try {
+                        windowManager?.updateViewLayout(panel, params)
+                    } catch (_: Exception) {
+                    }
+
+                    true
+                }
+
+                else -> false
+            }
+        }
+    }
+
+    private fun updateWidgetLayout() {
+        val panel = floatingWidget ?: return
+        val params = widgetParams ?: return
+
+        try {
+            windowManager?.updateViewLayout(panel, params)
+        } catch (_: Exception) {
+        }
     }
 
     private fun togglePause() {
@@ -584,40 +657,20 @@ class RecordingService : Service() {
 
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-
                 if (isPaused) {
-                    // RESUME RECORDING
                     recorder.resume()
-
                     isPaused = false
-                    recordingStartTime = SystemClock.elapsedRealtime()
-
                     pauseButton?.text = "Ⅱ"
-
-                    // Restart timer updates
-                    timerHandler.removeCallbacks(timerRunnable)
-                    timerHandler.post(timerRunnable)
 
                     Toast.makeText(
                         this,
                         "Recording resumed",
                         Toast.LENGTH_SHORT
                     ).show()
-
                 } else {
-                    // PAUSE RECORDING
-                    accumulatedRecordingTime +=
-                        SystemClock.elapsedRealtime() - recordingStartTime
-
                     recorder.pause()
-
                     isPaused = true
                     pauseButton?.text = "▶"
-
-                    // Stop timer updates while paused
-                    timerHandler.removeCallbacks(timerRunnable)
-
-                    updateRecordingTimer()
 
                     Toast.makeText(
                         this,
@@ -627,7 +680,6 @@ class RecordingService : Service() {
                 }
 
                 sendRecordingState(true)
-
             } else {
                 Toast.makeText(
                     this,
@@ -635,7 +687,6 @@ class RecordingService : Service() {
                     Toast.LENGTH_LONG
                 ).show()
             }
-
         } catch (e: Exception) {
             e.printStackTrace()
 
@@ -657,15 +708,16 @@ class RecordingService : Service() {
 
         floatingWidget = null
         pauseButton = null
-        timerText = null
         widgetParams = null
+        widgetCollapsed = false
     }
+
+    // STOP AND SAVE RECORDING
 
     private fun finishRecording() {
         if (isStopping) return
 
         isStopping = true
-        timerHandler.removeCallbacks(timerRunnable)
 
         val wasRecording = isRecording
         var successfullySaved = false
@@ -763,29 +815,14 @@ class RecordingService : Service() {
         foregroundStarted = false
     }
 
+    // NOTIFICATION: NO STOP ACTION BUTTON
+
     private fun buildNotification(): Notification {
-        val stopIntent = Intent(this, RecordingService::class.java).apply {
-            action = ACTION_STOP
-        }
-
-        val stopPendingIntent = PendingIntent.getService(
-            this,
-            1002,
-            stopIntent,
-            PendingIntent.FLAG_UPDATE_CURRENT or
-                PendingIntent.FLAG_IMMUTABLE
-        )
-
         return Notification.Builder(this, CHANNEL_ID)
             .setContentTitle("ScreenPro Recorder")
             .setContentText("Your screen is being recorded")
             .setSmallIcon(android.R.drawable.presence_video_online)
             .setOngoing(true)
-            .addAction(
-                android.R.drawable.ic_media_pause,
-                "Stop Recording",
-                stopPendingIntent
-            )
             .build()
     }
 
@@ -796,7 +833,7 @@ class RecordingService : Service() {
                 "ScreenPro Recording",
                 NotificationManager.IMPORTANCE_LOW
             ).apply {
-                description = "Screen recording controls"
+                description = "Screen recording status"
             }
 
             val manager =
