@@ -1,8 +1,6 @@
-
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-    <!-- Required permissions -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
@@ -16,7 +14,6 @@
         android:theme="@android:style/Theme.Material.Light.NoActionBar"
         android:supportsRtl="true">
 
-        <!-- Main app screen -->
         <activity
             android:name=".MainActivity"
             android:exported="true">
@@ -28,7 +25,6 @@
 
         </activity>
 
-        <!-- Screen recording service -->
         <service
             android:name=".RecordingService"
             android:exported="false"
