@@ -9,7 +9,6 @@
 
     <application
         android:allowBackup="false"
-        android:icon="@drawable/ic_screenpro"
         android:label="ScreenPro Recorder"
         android:theme="@android:style/Theme.Material.Light.NoActionBar"
         android:supportsRtl="true">
