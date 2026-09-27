@@ -12,6 +12,7 @@ import android.graphics.drawable.GradientDrawable
 import android.media.projection.MediaProjectionManager
 import android.os.Build
 import android.os.Bundle
+import android.os.SystemClock
 import android.view.Gravity
 import android.view.View
 import android.widget.*
@@ -20,11 +21,14 @@ class MainActivity : Activity() {
 
     private lateinit var projectionManager: MediaProjectionManager
     private lateinit var status: TextView
+    private lateinit var timer: Chronometer
     private lateinit var startButton: Button
     private lateinit var stopButton: Button
+    private lateinit var recordingsCount: TextView
 
     private var pendingStart = false
     private var recording = false
+    private var receiverRegistered = false
 
     private val receiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -52,194 +56,192 @@ class MainActivity : Activity() {
 
         createUi()
         setRecording(recording)
+        updateRecordingCount()
     }
 
     override fun onResume() {
         super.onResume()
 
-        val filter = IntentFilter(
-            RecordingService.ACTION_STATE_CHANGED
-        )
+        if (!receiverRegistered) {
+            val filter = IntentFilter(RecordingService.ACTION_STATE_CHANGED)
 
-        if (Build.VERSION.SDK_INT >= 33) {
-            registerReceiver(receiver, filter, RECEIVER_NOT_EXPORTED)
-        } else {
-            registerReceiver(receiver, filter)
+            if (Build.VERSION.SDK_INT >= 33) {
+                registerReceiver(receiver, filter, RECEIVER_NOT_EXPORTED)
+            } else {
+                registerReceiver(receiver, filter)
+            }
+
+            receiverRegistered = true
         }
 
         setRecording(
             getSharedPreferences("screenpro", MODE_PRIVATE)
                 .getBoolean("recording", recording)
         )
+
+        updateRecordingCount()
     }
 
     override fun onPause() {
-        try {
-            unregisterReceiver(receiver)
-        } catch (_: Exception) {
+        if (receiverRegistered) {
+            try {
+                unregisterReceiver(receiver)
+            } catch (_: Exception) {
+            }
+            receiverRegistered = false
         }
 
         super.onPause()
     }
 
     private fun createUi() {
-
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(0xFFF5F7FB.toInt())
+            setBackgroundColor(0xFFF4F6FA.toInt())
         }
 
         val scroll = ScrollView(this)
-
         val page = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(22), dp(24), dp(22), dp(28))
+            setPadding(dp(20), dp(20), dp(20), dp(28))
         }
 
         scroll.addView(page)
 
-        // HEADER
-
+        // TOP BAR
         val header = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
         }
 
-        val logo = label("▶", 27, Color.WHITE, true).apply {
+        val logo = label("▶", 25, Color.WHITE, true).apply {
             gravity = Gravity.CENTER
-            background = rounded(0xFFE12F43.toInt(), 16)
-            layoutParams = LinearLayout.LayoutParams(
-                dp(54),
-                dp(54)
-            )
+            background = rounded(0xFFE52F45.toInt(), 17)
+            elevation = dp(3).toFloat()
+            layoutParams = LinearLayout.LayoutParams(dp(52), dp(52))
         }
 
         header.addView(logo)
 
-        val branding = LinearLayout(this).apply {
+        val brand = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(12), 0, 0, 0)
         }
 
-        branding.addView(
-            label("ScreenPro", 23, 0xFF182032.toInt(), true)
-        )
-
-        branding.addView(
-            label("SCREEN RECORDER", 11, 0xFF778196.toInt(), true)
-        )
+        brand.addView(label("ScreenPro", 23, 0xFF172033.toInt(), true))
+        brand.addView(label("SCREEN RECORDER", 10, 0xFF7A8497.toInt(), true))
 
         header.addView(
-            branding,
+            brand,
             LinearLayout.LayoutParams(0, -2, 1f)
         )
 
-        header.addView(
-            label("● READY", 11, 0xFF198754.toInt(), true).apply {
-                setPadding(dp(12), dp(9), dp(12), dp(9))
-                background = rounded(0xFFE4F5EC.toInt(), 30)
-            }
-        )
+        val menuButton = TextView(this).apply {
+            text = "☰"
+            textSize = 25f
+            gravity = Gravity.CENTER
+            setTextColor(0xFF172033.toInt())
+            background = rounded(Color.WHITE, 15)
+            elevation = dp(2).toFloat()
+            layoutParams = LinearLayout.LayoutParams(dp(48), dp(48))
+            setOnClickListener { showAppMenu() }
+        }
 
+        header.addView(menuButton)
         page.addView(header)
 
-        // INTRODUCTION
-
-        val heading = label(
-            "Capture every moment.",
+        // GREETING / INTRO
+        val intro = label(
+            "Your screen. Your story.",
             27,
-            0xFF182032.toInt(),
+            0xFF172033.toInt(),
             true
         )
-
-        heading.setPadding(0, dp(30), 0, dp(5))
-        page.addView(heading)
+        intro.setPadding(0, dp(28), 0, dp(6))
+        page.addView(intro)
 
         page.addView(
             label(
-                "Record your screen with microphone audio.",
+                "Capture tutorials, gameplay, meetings and moments.",
                 14,
-                0xFF778196.toInt(),
+                0xFF758095.toInt(),
                 false
             )
         )
 
-        // RECORDING PANEL
-
-        val panel = LinearLayout(this).apply {
+        // RECORDING STATUS WIDGET
+        val statusCard = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            gravity = Gravity.CENTER
-            setPadding(dp(20), dp(25), dp(20), dp(24))
-            background = rounded(Color.WHITE, 24)
-            elevation = dp(3).toFloat()
+            setPadding(dp(20), dp(20), dp(20), dp(20))
+            background = rounded(0xFF172033.toInt(), 24)
+            elevation = dp(4).toFloat()
         }
 
-        panel.addView(
-            label("▣", 46, 0xFFE12F43.toInt(), true).apply {
-                gravity = Gravity.CENTER
-                background = rounded(0xFFFFEFF1.toInt(), 22)
+        val statusHeader = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
 
-                layoutParams = LinearLayout.LayoutParams(
-                    dp(92),
-                    dp(92)
-                ).apply {
-                    bottomMargin = dp(17)
-                }
-            }
+        statusHeader.addView(
+            label("●  RECORDING STUDIO", 12, 0xFFBFC8D8.toInt(), true),
+            LinearLayout.LayoutParams(0, -2, 1f)
         )
 
-        panel.addView(
-            label(
-                "00:00:00",
-                34,
-                0xFF182032.toInt(),
-                true
-            ).apply {
-                gravity = Gravity.CENTER
-            }
-        )
+        val readyBadge = label("READY", 10, 0xFF198754.toInt(), true).apply {
+            gravity = Gravity.CENTER
+            setPadding(dp(12), dp(7), dp(12), dp(7))
+            background = rounded(0xFFE3F5EB.toInt(), 30)
+        }
+
+        statusHeader.addView(readyBadge)
+        statusCard.addView(statusHeader)
+
+        timer = Chronometer(this).apply {
+            text = "00:00"
+            textSize = 43f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(Color.WHITE)
+            gravity = Gravity.CENTER
+            setPadding(0, dp(24), 0, dp(4))
+        }
+
+        statusCard.addView(timer)
 
         status = label(
             "Ready when you are",
-            14,
-            0xFF778196.toInt(),
+            13,
+            0xFFBFC8D8.toInt(),
             false
         ).apply {
             gravity = Gravity.CENTER
-            setPadding(0, dp(8), 0, dp(22))
+            setPadding(0, dp(4), 0, dp(22))
         }
 
-        panel.addView(status)
-
-        // START BUTTON
+        statusCard.addView(status)
 
         startButton = Button(this).apply {
             text = "●   START RECORDING"
             textSize = 15f
             isAllCaps = false
             setTextColor(Color.WHITE)
-            background = rounded(0xFFE12F43.toInt(), 16)
-
+            background = rounded(0xFFE52F45.toInt(), 16)
             setOnClickListener {
                 requestPermissionsAndCapture()
             }
         }
 
-        panel.addView(
+        statusCard.addView(
             startButton,
             LinearLayout.LayoutParams(-1, dp(58))
         )
-
-        // STOP BUTTON
 
         stopButton = Button(this).apply {
             text = "■   STOP RECORDING"
             textSize = 15f
             isAllCaps = false
             setTextColor(Color.WHITE)
-            background = rounded(0xFF232D40.toInt(), 16)
+            background = rounded(0xFF344158.toInt(), 16)
             visibility = View.GONE
-
             setOnClickListener {
                 startService(
                     Intent(
@@ -247,8 +249,6 @@ class MainActivity : Activity() {
                         RecordingService::class.java
                     ).setAction(RecordingService.ACTION_STOP)
                 )
-
-                setRecording(false)
 
                 Toast.makeText(
                     this@MainActivity,
@@ -258,7 +258,7 @@ class MainActivity : Activity() {
             }
         }
 
-        panel.addView(
+        statusCard.addView(
             stopButton,
             LinearLayout.LayoutParams(-1, dp(58)).apply {
                 topMargin = dp(10)
@@ -266,109 +266,110 @@ class MainActivity : Activity() {
         )
 
         page.addView(
-            panel,
+            statusCard,
             LinearLayout.LayoutParams(-1, -2).apply {
                 topMargin = dp(25)
             }
         )
 
-        // RECORDINGS HEADER
+        // QUICK FEATURE WIDGETS
+        page.addView(
+            label("Quick features", 19, 0xFF172033.toInt(), true).apply {
+                setPadding(0, dp(27), 0, dp(13))
+            }
+        )
 
-        val row = LinearLayout(this).apply {
+        val featureRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, dp(28), 0, dp(12))
         }
 
-        row.addView(
-            label(
-                "My recordings",
-                20,
-                0xFF182032.toInt(),
-                true
-            ),
+        featureRow.addView(
+            featureCard("🎙", "Microphone", "Audio capture"),
+            LinearLayout.LayoutParams(0, dp(112), 1f).apply {
+                rightMargin = dp(7)
+            }
+        )
+
+        featureRow.addView(
+            featureCard("▣", "HD Video", "Screen capture"),
+            LinearLayout.LayoutParams(0, dp(112), 1f).apply {
+                leftMargin = dp(7)
+            }
+        )
+
+        page.addView(featureRow)
+
+        // RECORDINGS LIBRARY
+        val libraryHeader = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(28), 0, dp(13))
+        }
+
+        libraryHeader.addView(
+            label("My recordings", 19, 0xFF172033.toInt(), true),
             LinearLayout.LayoutParams(0, -2, 1f)
         )
 
-        row.addView(
-            label(
-                "VIEW ALL  ›",
-                12,
-                0xFFE12F43.toInt(),
-                true
-            ).apply {
-                setOnClickListener {
-                    showRecordings()
-                }
+        libraryHeader.addView(
+            label("VIEW ALL  ›", 12, 0xFFE52F45.toInt(), true).apply {
+                setOnClickListener { showRecordings() }
             }
         )
 
-        page.addView(row)
+        page.addView(libraryHeader)
 
-        // VIDEO LIBRARY CARD
-
-        val library = LinearLayout(this).apply {
+        val libraryCard = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             setPadding(dp(16), dp(16), dp(16), dp(16))
-            background = rounded(Color.WHITE, 18)
-
-            setOnClickListener {
-                showRecordings()
-            }
+            background = rounded(Color.WHITE, 19)
+            elevation = dp(2).toFloat()
+            setOnClickListener { showRecordings() }
         }
 
-        library.addView(
-            label("▶", 23, 0xFFE12F43.toInt(), true).apply {
-                gravity = Gravity.CENTER
-                background = rounded(0xFFFFEFF1.toInt(), 14)
+        val libraryIcon = label("▶", 22, 0xFFE52F45.toInt(), true).apply {
+            gravity = Gravity.CENTER
+            background = rounded(0xFFFFEDF0.toInt(), 15)
+            layoutParams = LinearLayout.LayoutParams(dp(52), dp(52))
+        }
 
-                layoutParams = LinearLayout.LayoutParams(
-                    dp(52),
-                    dp(52)
-                )
-            }
-        )
+        libraryCard.addView(libraryIcon)
 
-        val libraryCopy = LinearLayout(this).apply {
+        val libraryText = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(13), 0, 0, 0)
         }
 
-        libraryCopy.addView(
-            label(
-                "Recorded videos",
-                15,
-                0xFF182032.toInt(),
-                true
-            )
+        libraryText.addView(
+            label("Recorded videos", 15, 0xFF172033.toInt(), true)
         )
 
-        libraryCopy.addView(
-            label(
-                "Browse and play your captures",
-                12,
-                0xFF778196.toInt(),
-                false
-            )
+        recordingsCount = label(
+            "Browse your saved captures",
+            12,
+            0xFF7A8497.toInt(),
+            false
         )
 
-        library.addView(
-            libraryCopy,
+        libraryText.addView(recordingsCount)
+
+        libraryCard.addView(
+            libraryText,
             LinearLayout.LayoutParams(0, -2, 1f)
         )
 
-        library.addView(
-            label("›", 27, 0xFF778196.toInt(), false)
+        libraryCard.addView(
+            label("›", 28, 0xFF7A8497.toInt(), false)
         )
 
-        page.addView(library)
+        page.addView(libraryCard)
 
         page.addView(
             label(
-                "Your recordings are saved on this device.",
+                "Your videos are saved on this device.",
                 12,
-                0xFF8792A5.toInt(),
+                0xFF8A94A6.toInt(),
                 false
             ).apply {
                 gravity = Gravity.CENTER
@@ -376,57 +377,136 @@ class MainActivity : Activity() {
             }
         )
 
-        root.addView(
-            scroll,
-            LinearLayout.LayoutParams(-1, -1)
-        )
-
+        root.addView(scroll, LinearLayout.LayoutParams(-1, -1))
         setContentView(root)
     }
 
-    // UPDATE RECORDING INTERFACE
+    private fun featureCard(
+        icon: String,
+        title: String,
+        subtitle: String
+    ): View {
+        val card = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(15), dp(12), dp(12), dp(12))
+            background = rounded(Color.WHITE, 18)
+            elevation = dp(2).toFloat()
+        }
+
+        card.addView(label(icon, 24, 0xFFE52F45.toInt(), true))
+        card.addView(
+            label(title, 14, 0xFF172033.toInt(), true).apply {
+                setPadding(0, dp(5), 0, dp(2))
+            }
+        )
+        card.addView(label(subtitle, 11, 0xFF7A8497.toInt(), false))
+
+        return card
+    }
+
+    private fun showAppMenu() {
+        val options = arrayOf(
+            "▶   My Recordings",
+            "ⓘ   Recording Guide",
+            "⚙   About ScreenPro"
+        )
+
+        AlertDialog.Builder(this)
+            .setTitle("ScreenPro Menu")
+            .setItems(options) { _, which ->
+                when (which) {
+                    0 -> showRecordings()
+                    1 -> showRecordingGuide()
+                    2 -> showAbout()
+                }
+            }
+            .setNegativeButton("Close", null)
+            .show()
+    }
+
+    private fun showRecordingGuide() {
+        AlertDialog.Builder(this)
+            .setTitle("Recording Guide")
+            .setMessage(
+                "1. Tap Start Recording.\n\n" +
+                "2. Allow microphone access if requested.\n\n" +
+                "3. Confirm Android's screen-capture prompt.\n\n" +
+                "4. Stop the recording when finished.\n\n" +
+                "5. Open My Recordings to play saved videos."
+            )
+            .setPositiveButton("Got it", null)
+            .show()
+    }
+
+    private fun showAbout() {
+        AlertDialog.Builder(this)
+            .setTitle("About ScreenPro")
+            .setMessage(
+                "ScreenPro Recorder\n\n" +
+                "A simple screen recording app for capturing " +
+                "your screen with microphone audio.\n\n" +
+                "Version 1.0"
+            )
+            .setPositiveButton("Close", null)
+            .show()
+    }
+
+    private fun updateRecordingCount() {
+        if (!::recordingsCount.isInitialized) return
+
+        val count = try {
+            RecordingStore.list(this).size
+        } catch (_: Exception) {
+            0
+        }
+
+        recordingsCount.text =
+            if (count == 1) "1 saved video"
+            else "$count saved videos"
+    }
 
     private fun setRecording(active: Boolean) {
-
         recording = active
 
         if (!::startButton.isInitialized) return
 
-        startButton.visibility =
-            if (active) View.GONE else View.VISIBLE
+        startButton.visibility = if (active) View.GONE else View.VISIBLE
+        stopButton.visibility = if (active) View.VISIBLE else View.GONE
 
-        stopButton.visibility =
-            if (active) View.VISIBLE else View.GONE
+        status.text = if (active) {
+            "● Recording in progress"
+        } else {
+            "Ready when you are"
+        }
 
-        status.text =
-            if (active)
-                "● Recording in progress — tap stop when finished"
-            else
-                "Ready when you are"
+        if (active) {
+            timer.base = SystemClock.elapsedRealtime()
+            timer.start()
+        } else {
+            timer.stop()
+            timer.text = "00:00"
+            updateRecordingCount()
+        }
     }
 
-    // PERMISSIONS AND SCREEN CAPTURE
-
     private fun requestPermissionsAndCapture() {
-
         if (
-            checkSelfPermission(Manifest.permission.RECORD_AUDIO)
-            != PackageManager.PERMISSION_GRANTED
+            checkSelfPermission(Manifest.permission.RECORD_AUDIO) !=
+            PackageManager.PERMISSION_GRANTED
         ) {
             pendingStart = true
-
             requestPermissions(
                 arrayOf(Manifest.permission.RECORD_AUDIO),
                 1002
             )
-
             return
         }
 
         if (
             Build.VERSION.SDK_INT >= 33 &&
-            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)
-            != PackageManager.PERMISSION_GRANTED
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) !=
+            PackageManager.PERMISSION_GRANTED
         ) {
             requestPermissions(
                 arrayOf(Manifest.permission.POST_NOTIFICATIONS),
@@ -445,14 +525,9 @@ class MainActivity : Activity() {
         permissions: Array<out String>,
         results: IntArray
     ) {
-        super.onRequestPermissionsResult(
-            requestCode,
-            permissions,
-            results
-        )
+        super.onRequestPermissionsResult(requestCode, permissions, results)
 
         if (requestCode == 1002) {
-
             if (
                 results.isNotEmpty() &&
                 results[0] == PackageManager.PERMISSION_GRANTED &&
@@ -460,10 +535,8 @@ class MainActivity : Activity() {
             ) {
                 pendingStart = false
                 requestPermissionsAndCapture()
-
             } else {
                 pendingStart = false
-
                 Toast.makeText(
                     this,
                     "Microphone permission is required for audio recording.",
@@ -484,22 +557,10 @@ class MainActivity : Activity() {
         if (requestCode != 1001) return
 
         if (resultCode == RESULT_OK && data != null) {
-
-            val service = Intent(
-                this,
-                RecordingService::class.java
-            ).apply {
+            val service = Intent(this, RecordingService::class.java).apply {
                 action = RecordingService.ACTION_START
-
-                putExtra(
-                    RecordingService.EXTRA_RESULT_CODE,
-                    resultCode
-                )
-
-                putExtra(
-                    RecordingService.EXTRA_RESULT_DATA,
-                    data
-                )
+                putExtra(RecordingService.EXTRA_RESULT_CODE, resultCode)
+                putExtra(RecordingService.EXTRA_RESULT_DATA, data)
             }
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -513,20 +574,15 @@ class MainActivity : Activity() {
                 "ScreenPro is starting…",
                 Toast.LENGTH_SHORT
             ).show()
-
         } else {
             status.text = "Screen capture permission was not granted."
         }
     }
 
-    // RECORDINGS LIBRARY
-
     private fun showRecordings() {
-
         val items = RecordingStore.list(this)
 
         if (items.isEmpty()) {
-
             AlertDialog.Builder(this)
                 .setTitle("No recordings yet")
                 .setMessage(
@@ -534,24 +590,20 @@ class MainActivity : Activity() {
                 )
                 .setPositiveButton("OK", null)
                 .show()
-
             return
         }
 
         val names = items.mapIndexed { index, uri ->
-            "Recording ${items.size - index}  •  ${uri.lastPathSegment ?: "Video file"}"
+            "Recording ${items.size - index}  •  " +
+            (uri.lastPathSegment ?: "Video file")
         }.toTypedArray()
 
         AlertDialog.Builder(this)
             .setTitle("Your recordings")
             .setItems(names) { _, which ->
-
                 val play = Intent(Intent.ACTION_VIEW).apply {
                     setDataAndType(items[which], "video/mp4")
-
-                    addFlags(
-                        Intent.FLAG_GRANT_READ_URI_PERMISSION
-                    )
+                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                 }
 
                 try {
@@ -568,15 +620,12 @@ class MainActivity : Activity() {
             .show()
     }
 
-    // UI HELPERS
-
     private fun label(
         value: String,
         size: Int,
         color: Int,
         bold: Boolean
     ) = TextView(this).apply {
-
         text = value
         textSize = size.toFloat()
         setTextColor(color)
@@ -586,18 +635,13 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun rounded(
-        color: Int,
-        radius: Int
-    ) = GradientDrawable().apply {
-
-        setColor(color)
-        cornerRadius = dp(radius).toFloat()
-    }
+    private fun rounded(color: Int, radius: Int) =
+        GradientDrawable().apply {
+            setColor(color)
+            cornerRadius = dp(radius).toFloat()
+        }
 
     private fun dp(value: Int): Int {
-        return (
-            value * resources.displayMetrics.density
-        ).toInt()
+        return (value * resources.displayMetrics.density).toInt()
     }
 }
