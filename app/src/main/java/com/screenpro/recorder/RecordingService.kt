@@ -26,6 +26,7 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.ParcelFileDescriptor
+import android.os.SystemClock
 import android.provider.MediaStore
 import android.util.DisplayMetrics
 import android.view.Gravity
@@ -71,6 +72,7 @@ class RecordingService : Service() {
     private var windowManager: WindowManager? = null
     private var floatingWidget: View? = null
     private var pauseButton: Button? = null
+    private var timerText: TextView? = null
     private var widgetParams: WindowManager.LayoutParams? = null
 
     private var initialTouchX = 0f
@@ -78,8 +80,23 @@ class RecordingService : Service() {
     private var initialWidgetX = 0
     private var initialWidgetY = 0
 
+    private var recordingStartTime = 0L
+    private var accumulatedRecordingTime = 0L
+
     private lateinit var projectionManager: MediaProjectionManager
+
     private val mainHandler = Handler(Looper.getMainLooper())
+
+    private val timerHandler = Handler(Looper.getMainLooper())
+
+    private val timerRunnable = object : Runnable {
+        override fun run() {
+            if (!isRecording || isStopping) return
+
+            updateRecordingTimer()
+            timerHandler.postDelayed(this, 1000)
+        }
+    }
 
     private val projectionCallback = object : MediaProjection.Callback() {
         override fun onStop() {
@@ -144,21 +161,19 @@ class RecordingService : Service() {
             return
         }
 
+        val micEnabled = getSharedPreferences(
+            "screenpro",
+            MODE_PRIVATE
+        ).getBoolean("microphone_enabled", true)
+
         if (
+            micEnabled &&
             checkSelfPermission(Manifest.permission.RECORD_AUDIO) !=
             PackageManager.PERMISSION_GRANTED
         ) {
-            // Microphone permission is only required when mic audio is enabled.
-            val micEnabled = getSharedPreferences(
-                "screenpro",
-                MODE_PRIVATE
-            ).getBoolean("microphone_enabled", true)
-
-            if (micEnabled) {
-                sendRecordingState(false)
-                stopSelf()
-                return
-            }
+            sendRecordingState(false)
+            stopSelf()
+            return
         }
 
         try {
@@ -209,6 +224,7 @@ class RecordingService : Service() {
     ) {
         isStopping = false
         isPaused = false
+        accumulatedRecordingTime = 0L
 
         val prefs = getSharedPreferences(
             "screenpro",
@@ -338,7 +354,14 @@ class RecordingService : Service() {
         isRecording = true
         isPaused = false
 
+        recordingStartTime = SystemClock.elapsedRealtime()
+        accumulatedRecordingTime = 0L
+
         showFloatingWidget()
+
+        timerHandler.removeCallbacks(timerRunnable)
+        timerHandler.post(timerRunnable)
+
         sendRecordingState(true)
     }
 
@@ -349,7 +372,6 @@ class RecordingService : Service() {
     ): Pair<Int, Int> {
 
         val longer = maxOf(screenWidth, screenHeight).toFloat()
-        val shorter = minOf(screenWidth, screenHeight).toFloat()
 
         val targetLongSide = when (quality) {
             "Standard" -> 1280f
@@ -362,7 +384,6 @@ class RecordingService : Service() {
         var width = (screenWidth * scale).toInt()
         var height = (screenHeight * scale).toInt()
 
-        // MediaRecorder requires even dimensions for common H.264 encoders.
         width = (width / 2) * 2
         height = (height / 2) * 2
 
@@ -384,7 +405,7 @@ class RecordingService : Service() {
         sendBroadcast(stateIntent)
     }
 
-    // FLOATING WIDGET
+    // FLOATING SIDEBAR
 
     private fun showFloatingWidget() {
         if (!isRecording || floatingWidget != null) return
@@ -405,20 +426,36 @@ class RecordingService : Service() {
             val panel = LinearLayout(this).apply {
                 orientation = LinearLayout.VERTICAL
                 gravity = Gravity.CENTER
-                setPadding(dp(8), dp(10), dp(8), dp(10))
+                setPadding(dp(7), dp(9), dp(7), dp(9))
                 background = rounded(0xEE172033.toInt(), 18)
                 elevation = dp(8).toFloat()
             }
 
             val dragHandle = TextView(this).apply {
-                text = "⋮⋮"
-                textSize = 17f
+                text = "⠿"
+                textSize = 22f
                 gravity = Gravity.CENTER
                 setTextColor(Color.WHITE)
-                setPadding(dp(4), dp(2), dp(4), dp(8))
+                setPadding(dp(4), dp(2), dp(4), dp(5))
             }
 
-            panel.addView(dragHandle)
+            panel.addView(
+                dragHandle,
+                LinearLayout.LayoutParams(dp(54), dp(35))
+            )
+
+            timerText = TextView(this).apply {
+                text = "00:00"
+                textSize = 12f
+                gravity = Gravity.CENTER
+                setTextColor(Color.WHITE)
+                setPadding(dp(2), dp(2), dp(2), dp(8))
+            }
+
+            panel.addView(
+                timerText,
+                LinearLayout.LayoutParams(dp(58), dp(28))
+            )
 
             pauseButton = Button(this).apply {
                 text = "Ⅱ"
@@ -433,7 +470,7 @@ class RecordingService : Service() {
 
             panel.addView(
                 pauseButton,
-                LinearLayout.LayoutParams(dp(54), dp(48)).apply {
+                LinearLayout.LayoutParams(dp(54), dp(46)).apply {
                     bottomMargin = dp(7)
                 }
             )
@@ -452,7 +489,7 @@ class RecordingService : Service() {
 
             panel.addView(
                 stopButton,
-                LinearLayout.LayoutParams(dp(54), dp(48))
+                LinearLayout.LayoutParams(dp(54), dp(46))
             )
 
             val type =
@@ -472,7 +509,7 @@ class RecordingService : Service() {
                 PixelFormat.TRANSLUCENT
             ).apply {
                 gravity = Gravity.END or Gravity.CENTER_VERTICAL
-                x = dp(12)
+                x = dp(8)
                 y = 0
             }
 
@@ -501,6 +538,7 @@ class RecordingService : Service() {
                         true
                     }
 
+                    MotionEvent.ACTION_UP -> true
                     else -> false
                 }
             }
@@ -512,9 +550,31 @@ class RecordingService : Service() {
             floatingWidget = panel
             widgetParams = params
 
+            updateRecordingTimer()
+
         } catch (e: Exception) {
             e.printStackTrace()
         }
+    }
+
+    private fun updateRecordingTimer() {
+        val elapsed = if (isPaused) {
+            accumulatedRecordingTime
+        } else {
+            accumulatedRecordingTime +
+                (SystemClock.elapsedRealtime() - recordingStartTime)
+        }
+
+        val totalSeconds = elapsed / 1000
+        val minutes = totalSeconds / 60
+        val seconds = totalSeconds % 60
+
+        timerText?.text = String.format(
+            Locale.US,
+            "%02d:%02d",
+            minutes,
+            seconds
+        )
     }
 
     private fun togglePause() {
@@ -526,8 +586,12 @@ class RecordingService : Service() {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
                 if (isPaused) {
                     recorder.resume()
+
                     isPaused = false
+                    recordingStartTime = SystemClock.elapsedRealtime()
+
                     pauseButton?.text = "Ⅱ"
+
                     Toast.makeText(
                         this,
                         "Recording resumed",
@@ -535,8 +599,13 @@ class RecordingService : Service() {
                     ).show()
                 } else {
                     recorder.pause()
+
+                    accumulatedRecordingTime +=
+                        SystemClock.elapsedRealtime() - recordingStartTime
+
                     isPaused = true
                     pauseButton?.text = "▶"
+
                     Toast.makeText(
                         this,
                         "Recording paused",
@@ -544,7 +613,9 @@ class RecordingService : Service() {
                     ).show()
                 }
 
+                updateRecordingTimer()
                 sendRecordingState(true)
+
             } else {
                 Toast.makeText(
                     this,
@@ -552,8 +623,10 @@ class RecordingService : Service() {
                     Toast.LENGTH_LONG
                 ).show()
             }
+
         } catch (e: Exception) {
             e.printStackTrace()
+
             Toast.makeText(
                 this,
                 "Unable to change recording state.",
@@ -572,6 +645,7 @@ class RecordingService : Service() {
 
         floatingWidget = null
         pauseButton = null
+        timerText = null
         widgetParams = null
     }
 
@@ -579,6 +653,7 @@ class RecordingService : Service() {
         if (isStopping) return
 
         isStopping = true
+        timerHandler.removeCallbacks(timerRunnable)
 
         val wasRecording = isRecording
         var successfullySaved = false
