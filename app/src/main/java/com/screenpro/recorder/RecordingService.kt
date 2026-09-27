@@ -1,4 +1,3 @@
-
 package com.screenpro.recorder
 
 import android.Manifest
@@ -55,13 +54,14 @@ class RecordingService : Service() {
 
     private var isRecording = false
     private var isStopping = false
+    private var foregroundStarted = false
 
     private lateinit var projectionManager: MediaProjectionManager
     private val mainHandler = Handler(Looper.getMainLooper())
 
     private val projectionCallback = object : MediaProjection.Callback() {
         override fun onStop() {
-            stopRecording()
+            finishRecording()
             stopSelf()
         }
     }
@@ -83,57 +83,59 @@ class RecordingService : Service() {
     ): Int {
 
         when (intent?.action) {
-            ACTION_START -> {
-                if (isRecording) {
-                    return START_NOT_STICKY
-                }
-
-                val resultCode = intent.getIntExtra(
-                    EXTRA_RESULT_CODE,
-                    Activity.RESULT_CANCELED
-                )
-
-                val resultData: Intent? =
-                    if (Build.VERSION.SDK_INT >= 33) {
-                        intent.getParcelableExtra(
-                            EXTRA_RESULT_DATA,
-                            Intent::class.java
-                        )
-                    } else {
-                        @Suppress("DEPRECATION")
-                        intent.getParcelableExtra(EXTRA_RESULT_DATA)
-                    }
-
-                if (resultCode != Activity.RESULT_OK || resultData == null) {
-                    stopSelf()
-                    return START_NOT_STICKY
-                }
-
-                if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) !=
-                    PackageManager.PERMISSION_GRANTED
-                ) {
-                    sendRecordingState(false)
-                    stopSelf()
-                    return START_NOT_STICKY
-                }
-
-                try {
-                    startRecordingForeground()
-                    startRecording(resultCode, resultData)
-                } catch (e: Exception) {
-                    e.printStackTrace()
-                    stopRecording()
-                    stopSelf()
-                }
-            }
+            ACTION_START -> handleStart(intent)
 
             ACTION_STOP -> {
-                stopRecording()
+                finishRecording()
                 stopSelf()
             }
         }
 
         return START_NOT_STICKY
+    }
+
+    private fun handleStart(intent: Intent) {
+        // Do not start another recording while stopping or already recording.
+        if (isRecording || isStopping) return
+
+        val resultCode = intent.getIntExtra(
+            EXTRA_RESULT_CODE,
+            Activity.RESULT_CANCELED
+        )
+
+        val resultData: Intent? =
+            if (Build.VERSION.SDK_INT >= 33) {
+                intent.getParcelableExtra(
+                    EXTRA_RESULT_DATA,
+                    Intent::class.java
+                )
+            } else {
+                @Suppress("DEPRECATION")
+                intent.getParcelableExtra(EXTRA_RESULT_DATA)
+            }
+
+        if (resultCode != Activity.RESULT_OK || resultData == null) {
+            sendRecordingState(false)
+            stopSelf()
+            return
+        }
+
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            sendRecordingState(false)
+            stopSelf()
+            return
+        }
+
+        try {
+            startRecordingForeground()
+            startRecording(resultCode, resultData)
+        } catch (e: Exception) {
+            e.printStackTrace()
+            finishRecording()
+            stopSelf()
+        }
     }
 
     private fun startRecordingForeground() {
@@ -157,114 +159,107 @@ class RecordingService : Service() {
         } else {
             startForeground(NOTIFICATION_ID, notification)
         }
+
+        foregroundStarted = true
     }
 
     private fun startRecording(
         resultCode: Int,
         resultData: Intent
     ) {
-        try {
-            isStopping = false
+        val metrics = DisplayMetrics()
 
-            val metrics = DisplayMetrics()
+        @Suppress("DEPRECATION")
+        val windowManager =
+            getSystemService(Context.WINDOW_SERVICE) as WindowManager
 
-            @Suppress("DEPRECATION")
-            val windowManager =
-                getSystemService(Context.WINDOW_SERVICE) as WindowManager
+        @Suppress("DEPRECATION")
+        windowManager.defaultDisplay.getRealMetrics(metrics)
 
-            @Suppress("DEPRECATION")
-            windowManager.defaultDisplay.getRealMetrics(metrics)
+        val width = metrics.widthPixels
+        val height = metrics.heightPixels
+        val density = metrics.densityDpi
 
-            val width = metrics.widthPixels
-            val height = metrics.heightPixels
-            val density = metrics.densityDpi
+        val filename = "ScreenPro_" +
+            SimpleDateFormat(
+                "yyyyMMdd_HHmmss",
+                Locale.US
+            ).format(Date()) + ".mp4"
 
-            val filename = "ScreenPro_" +
-                SimpleDateFormat(
-                    "yyyyMMdd_HHmmss",
-                    Locale.US
-                ).format(Date()) + ".mp4"
+        val contentValues = ContentValues().apply {
+            put(MediaStore.Video.Media.DISPLAY_NAME, filename)
+            put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
 
-            val contentValues = ContentValues().apply {
-                put(MediaStore.Video.Media.DISPLAY_NAME, filename)
-                put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
-
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    put(
-                        MediaStore.Video.Media.RELATIVE_PATH,
-                        "Movies/ScreenPro"
-                    )
-                    put(MediaStore.Video.Media.IS_PENDING, 1)
-                }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                put(
+                    MediaStore.Video.Media.RELATIVE_PATH,
+                    "Movies/ScreenPro"
+                )
+                put(MediaStore.Video.Media.IS_PENDING, 1)
             }
-
-            outputUri = contentResolver.insert(
-                MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
-                contentValues
-            ) ?: throw IllegalStateException("Could not create video file")
-
-            outputDescriptor =
-                contentResolver.openFileDescriptor(outputUri!!, "w")
-                    ?: throw IllegalStateException("Could not open video file")
-
-            mediaRecorder =
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                    MediaRecorder(this)
-                } else {
-                    @Suppress("DEPRECATION")
-                    MediaRecorder()
-                }
-
-            mediaRecorder?.apply {
-                setAudioSource(MediaRecorder.AudioSource.MIC)
-                setVideoSource(MediaRecorder.VideoSource.SURFACE)
-
-                setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
-                setVideoEncoder(MediaRecorder.VideoEncoder.H264)
-                setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
-
-                setVideoSize(width, height)
-                setVideoFrameRate(30)
-                setVideoEncodingBitRate(5_000_000)
-
-                setAudioEncodingBitRate(128_000)
-                setAudioSamplingRate(44100)
-
-                setOutputFile(outputDescriptor!!.fileDescriptor)
-                prepare()
-            }
-
-            mediaProjection = projectionManager.getMediaProjection(
-                resultCode,
-                resultData
-            ) ?: throw IllegalStateException("Could not start screen capture")
-
-            mediaProjection?.registerCallback(
-                projectionCallback,
-                mainHandler
-            )
-
-            virtualDisplay = mediaProjection?.createVirtualDisplay(
-                "ScreenProRecorder",
-                width,
-                height,
-                density,
-                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-                mediaRecorder?.surface,
-                null,
-                mainHandler
-            ) ?: throw IllegalStateException("Could not create virtual display")
-
-            mediaRecorder?.start()
-
-            isRecording = true
-            sendRecordingState(true)
-
-        } catch (e: Exception) {
-            e.printStackTrace()
-            stopRecording()
-            stopSelf()
         }
+
+        outputUri = contentResolver.insert(
+            MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
+            contentValues
+        ) ?: throw IllegalStateException("Could not create video file")
+
+        outputDescriptor =
+            contentResolver.openFileDescriptor(outputUri!!, "w")
+                ?: throw IllegalStateException("Could not open video file")
+
+        mediaRecorder =
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                MediaRecorder(this)
+            } else {
+                @Suppress("DEPRECATION")
+                MediaRecorder()
+            }
+
+        mediaRecorder?.apply {
+            setAudioSource(MediaRecorder.AudioSource.MIC)
+            setVideoSource(MediaRecorder.VideoSource.SURFACE)
+
+            setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
+            setVideoEncoder(MediaRecorder.VideoEncoder.H264)
+            setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
+
+            setVideoSize(width, height)
+            setVideoFrameRate(30)
+            setVideoEncodingBitRate(5_000_000)
+
+            setAudioEncodingBitRate(128_000)
+            setAudioSamplingRate(44100)
+
+            setOutputFile(outputDescriptor!!.fileDescriptor)
+            prepare()
+        }
+
+        mediaProjection = projectionManager.getMediaProjection(
+            resultCode,
+            resultData
+        ) ?: throw IllegalStateException("Could not start screen capture")
+
+        mediaProjection?.registerCallback(
+            projectionCallback,
+            mainHandler
+        )
+
+        virtualDisplay = mediaProjection?.createVirtualDisplay(
+            "ScreenProRecorder",
+            width,
+            height,
+            density,
+            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+            mediaRecorder?.surface,
+            null,
+            mainHandler
+        ) ?: throw IllegalStateException("Could not create virtual display")
+
+        mediaRecorder?.start()
+
+        isRecording = true
+        sendRecordingState(true)
     }
 
     private fun sendRecordingState(recording: Boolean) {
@@ -276,13 +271,15 @@ class RecordingService : Service() {
         sendBroadcast(stateIntent)
     }
 
-    private fun stopRecording() {
+    private fun finishRecording() {
         if (isStopping) return
+
         isStopping = true
 
         val wasRecording = isRecording
         var successfullySaved = false
 
+        // Stop the recorder before releasing its surface or projection.
         if (wasRecording) {
             try {
                 mediaRecorder?.stop()
@@ -334,24 +331,46 @@ class RecordingService : Service() {
         outputDescriptor = null
 
         outputUri?.let { uri ->
-            if (successfullySaved) {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    val values = ContentValues().apply {
-                        put(MediaStore.Video.Media.IS_PENDING, 0)
-                    }
+            try {
+                if (successfullySaved) {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                        val values = ContentValues().apply {
+                            put(MediaStore.Video.Media.IS_PENDING, 0)
+                        }
 
-                    contentResolver.update(uri, values, null, null)
+                        contentResolver.update(uri, values, null, null)
+                    }
+                } else {
+                    contentResolver.delete(uri, null, null)
                 }
-            } else {
-                contentResolver.delete(uri, null, null)
+            } catch (e: Exception) {
+                e.printStackTrace()
             }
         }
 
         outputUri = null
 
-        if (wasRecording) {
-            sendRecordingState(false)
+        // Always notify the activity that recording is no longer active.
+        sendRecordingState(false)
+
+        removeForegroundNotification()
+    }
+
+    private fun removeForegroundNotification() {
+        if (!foregroundStarted) return
+
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                stopForeground(STOP_FOREGROUND_REMOVE)
+            } else {
+                @Suppress("DEPRECATION")
+                stopForeground(true)
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
         }
+
+        foregroundStarted = false
     }
 
     private fun buildNotification(): Notification {
@@ -398,7 +417,7 @@ class RecordingService : Service() {
     }
 
     override fun onDestroy() {
-        stopRecording()
+        finishRecording()
         super.onDestroy()
     }
 
