@@ -123,8 +123,6 @@ class MainActivity : Activity() {
 
         val page = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-
-            // Extra top padding moves the header down from the status bar.
             setPadding(
                 dp(20),
                 dp(34),
@@ -142,7 +140,6 @@ class MainActivity : Activity() {
             gravity = Gravity.CENTER_VERTICAL
         }
 
-        // Smaller ScreenPro logo
         val logo = label(
             "▶",
             21,
@@ -189,7 +186,6 @@ class MainActivity : Activity() {
             LinearLayout.LayoutParams(0, -2, 1f)
         )
 
-        // Smaller menu button
         val menuButton = TextView(this).apply {
             text = "☰"
             textSize = 22f
@@ -406,7 +402,9 @@ class MainActivity : Activity() {
                 "🎙",
                 "Microphone",
                 "Audio capture"
-            ),
+            ) {
+                showMicrophoneOptions()
+            },
             LinearLayout.LayoutParams(0, dp(112), 1f).apply {
                 rightMargin = dp(7)
             }
@@ -416,8 +414,10 @@ class MainActivity : Activity() {
             featureCard(
                 "▣",
                 "HD Video",
-                "Screen capture"
-            ),
+                "Recording quality"
+            ) {
+                showVideoOptions()
+            },
             LinearLayout.LayoutParams(0, dp(112), 1f).apply {
                 leftMargin = dp(7)
             }
@@ -558,7 +558,8 @@ class MainActivity : Activity() {
     private fun featureCard(
         icon: String,
         title: String,
-        subtitle: String
+        subtitle: String,
+        onTap: () -> Unit
     ): View {
         val card = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -571,6 +572,12 @@ class MainActivity : Activity() {
             )
             background = rounded(Color.WHITE, 18)
             elevation = dp(2).toFloat()
+            isClickable = true
+            isFocusable = true
+
+            setOnClickListener {
+                onTap()
+            }
         }
 
         card.addView(
@@ -603,6 +610,109 @@ class MainActivity : Activity() {
         )
 
         return card
+    }
+
+    // MICROPHONE SETTINGS
+
+    private fun showMicrophoneOptions() {
+        val prefs = getSharedPreferences(
+            "screenpro",
+            MODE_PRIVATE
+        )
+
+        val microphoneEnabled = prefs.getBoolean(
+            "microphone_enabled",
+            true
+        )
+
+        AlertDialog.Builder(this)
+            .setTitle("Microphone Audio")
+            .setMessage(
+                "Choose whether ScreenPro should include microphone audio in recordings."
+            )
+            .setSingleChoiceItems(
+                arrayOf(
+                    "Microphone enabled",
+                    "Microphone muted"
+                ),
+                if (microphoneEnabled) 0 else 1
+            ) { dialog, which ->
+
+                prefs.edit()
+                    .putBoolean(
+                        "microphone_enabled",
+                        which == 0
+                    )
+                    .apply()
+
+                Toast.makeText(
+                    this,
+                    if (which == 0) {
+                        "Microphone enabled"
+                    } else {
+                        "Microphone muted"
+                    },
+                    Toast.LENGTH_SHORT
+                ).show()
+
+                dialog.dismiss()
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    // VIDEO QUALITY SETTINGS
+
+    private fun showVideoOptions() {
+        val prefs = getSharedPreferences(
+            "screenpro",
+            MODE_PRIVATE
+        )
+
+        val currentQuality = prefs.getString(
+            "video_quality",
+            "HD"
+        ) ?: "HD"
+
+        val options = arrayOf(
+            "Standard (720p)",
+            "HD (1080p)",
+            "High quality (device maximum)"
+        )
+
+        val selected = when (currentQuality) {
+            "Standard" -> 0
+            "Maximum" -> 2
+            else -> 1
+        }
+
+        AlertDialog.Builder(this)
+            .setTitle("Video Quality")
+            .setSingleChoiceItems(
+                options,
+                selected
+            ) { dialog, which ->
+
+                val quality = when (which) {
+                    0 -> "Standard"
+                    2 -> "Maximum"
+                    else -> "HD"
+                }
+
+                prefs.edit()
+                    .putString("video_quality", quality)
+                    .apply()
+
+                Toast.makeText(
+                    this,
+                    "$quality quality selected",
+                    Toast.LENGTH_SHORT
+                ).show()
+
+                dialog.dismiss()
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
     }
 
     // APP MENU
@@ -697,8 +807,6 @@ class MainActivity : Activity() {
                 stopButton.isEnabled = true
             }
 
-            // Start timer only on the transition from stopped to recording.
-            // Repeated active broadcasts will not reset it.
             if (!wasRecording && !timerRunning) {
                 timer.base = SystemClock.elapsedRealtime()
                 timer.start()
@@ -843,6 +951,7 @@ class MainActivity : Activity() {
                 ).show()
             } catch (e: Exception) {
                 status.text = "Could not start recording."
+
                 Toast.makeText(
                     this,
                     "Unable to start the recording service.",
