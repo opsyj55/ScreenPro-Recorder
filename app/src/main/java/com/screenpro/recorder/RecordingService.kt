@@ -6,6 +6,10 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
+import android.animation.ObjectAnimator
+import android.animation.ValueAnimator
+import android.app.PendingIntent
+import android.content.ComponentName
 import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
@@ -14,6 +18,10 @@ import android.content.pm.ServiceInfo
 import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.drawable.GradientDrawable
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
 import android.media.MediaRecorder
@@ -25,7 +33,9 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.ParcelFileDescriptor
+import android.os.SystemClock
 import android.provider.MediaStore
+import android.service.quicksettings.TileService
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
@@ -51,8 +61,37 @@ class RecordingService : Service() {
         const val EXTRA_IS_RECORDING = "is_recording"
         const val EXTRA_IS_PAUSED = "is_paused"
 
+        const val ACTION_TOGGLE_PAUSE = "com.screenpro.recorder.TOGGLE_PAUSE"
+
         private const val NOTIFICATION_ID = 1001
         private const val CHANNEL_ID = "screenpro_recording"
+
+        // Live state so the UI, tile and notification can always sync up.
+        @Volatile var isActive = false
+        @Volatile var isPausedNow = false
+        @Volatile var isCountingDown = false
+
+        private var startedAt = 0L
+        private var pausedAt = 0L
+        private var pausedTotal = 0L
+
+        fun elapsedMs(): Long {
+            if (!isActive) return 0L
+            val ref = if (isPausedNow) pausedAt else SystemClock.elapsedRealtime()
+            return (ref - startedAt - pausedTotal).coerceAtLeast(0L)
+        }
+
+        fun formatElapsed(ms: Long): String {
+            val total = ms / 1000
+            val h = total / 3600
+            val m = (total % 3600) / 60
+            val sec = total % 60
+            return if (h > 0) {
+                String.format(Locale.US, "%d:%02d:%02d", h, m, sec)
+            } else {
+                String.format(Locale.US, "%02d:%02d", m, sec)
+            }
+        }
     }
 
     private var mediaRecorder: MediaRecorder? = null
@@ -71,6 +110,30 @@ class RecordingService : Service() {
     private var pauseButton: Button? = null
     private var widgetParams: WindowManager.LayoutParams? = null
     private var widgetCollapsed = false
+
+    private var timerText: TextView? = null
+    private var dotView: TextView? = null
+    private var dotAnimator: ObjectAnimator? = null
+
+    private var countdownView: TextView? = null
+    private var countdownRunnable: Runnable? = null
+
+    private var sensorManager: SensorManager? = null
+    private var shakeListener: SensorEventListener? = null
+    private var firstShakeAt = 0L
+    private var lastShakeAt = 0L
+    private var shakeCount = 0
+
+    private val tickRunnable = object : Runnable {
+        override fun run() {
+            timerText?.text = formatElapsed(elapsedMs())
+            if (isRecording) mainHandler.postDelayed(this, 500)
+        }
+    }
+
+    private val collapseRunnable = Runnable {
+        if (isRecording && !widgetCollapsed) collapseWidget()
+    }
 
     private var initialTouchX = 0f
     private var initialTouchY = 0f
@@ -112,13 +175,15 @@ class RecordingService : Service() {
                 finishRecording()
                 stopSelf()
             }
+
+            ACTION_TOGGLE_PAUSE -> togglePause()
         }
 
         return START_NOT_STICKY
     }
 
     private fun handleStart(intent: Intent) {
-        if (isRecording || isStopping) return
+        if (isRecording || isStopping || isCountingDown) return
 
         val resultCode = intent.getIntExtra(
             EXTRA_RESULT_CODE,
@@ -159,7 +224,7 @@ class RecordingService : Service() {
 
         try {
             startRecordingForeground()
-            startRecording(resultCode, resultData)
+            beginWithCountdown(resultCode, resultData)
         } catch (e: Exception) {
             e.printStackTrace()
             finishRecording()
@@ -333,6 +398,14 @@ class RecordingService : Service() {
         isRecording = true
         isPaused = false
 
+        startedAt = SystemClock.elapsedRealtime()
+        pausedAt = 0L
+        pausedTotal = 0L
+        isPausedNow = false
+        isActive = true
+
+        updateNotification()
+        startShakeDetection()
         showFloatingWidget()
         sendRecordingState(true)
     }
@@ -377,6 +450,220 @@ class RecordingService : Service() {
         }
 
         sendBroadcast(stateIntent)
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            try {
+                TileService.requestListeningState(
+                    this,
+                    ComponentName(this, RecordingTileService::class.java)
+                )
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    // COUNTDOWN, SHAKE, DOT, NOTIFICATION HELPERS
+
+    private fun canOverlay(): Boolean {
+        return Build.VERSION.SDK_INT < Build.VERSION_CODES.M ||
+            android.provider.Settings.canDrawOverlays(this)
+    }
+
+    private fun overlayType(): Int {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+        } else {
+            @Suppress("DEPRECATION")
+            WindowManager.LayoutParams.TYPE_PHONE
+        }
+    }
+
+    private fun beginWithCountdown(resultCode: Int, resultData: Intent) {
+        val enabled = getSharedPreferences("screenpro", MODE_PRIVATE)
+            .getBoolean("countdown_enabled", true)
+
+        if (enabled && canOverlay()) {
+            runCountdown(3) { startRecordingSafely(resultCode, resultData) }
+        } else {
+            startRecordingSafely(resultCode, resultData)
+        }
+    }
+
+    private fun startRecordingSafely(resultCode: Int, resultData: Intent) {
+        try {
+            startRecording(resultCode, resultData)
+        } catch (e: Exception) {
+            e.printStackTrace()
+            finishRecording()
+            stopSelf()
+        }
+    }
+
+    private fun runCountdown(seconds: Int, onDone: () -> Unit) {
+        val tv = TextView(this).apply {
+            text = seconds.toString()
+            textSize = 84f
+            typeface = android.graphics.Typeface.DEFAULT_BOLD
+            gravity = Gravity.CENTER
+            setTextColor(Color.WHITE)
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(0xDD172033.toInt())
+            }
+        }
+
+        val size = dp(150)
+        val params = WindowManager.LayoutParams(
+            size,
+            size,
+            overlayType(),
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            PixelFormat.TRANSLUCENT
+        ).apply { gravity = Gravity.CENTER }
+
+        try {
+            windowManager?.addView(tv, params)
+        } catch (e: Exception) {
+            e.printStackTrace()
+            onDone()
+            return
+        }
+
+        countdownView = tv
+        isCountingDown = true
+        var remaining = seconds
+
+        val runnable = object : Runnable {
+            override fun run() {
+                if (isStopping) {
+                    cancelCountdown()
+                    return
+                }
+
+                remaining--
+
+                if (remaining > 0) {
+                    tv.text = remaining.toString()
+                    tv.scaleX = 1.35f
+                    tv.scaleY = 1.35f
+                    tv.animate().scaleX(1f).scaleY(1f).setDuration(400).start()
+                    mainHandler.postDelayed(this, 1000)
+                } else {
+                    removeCountdownView()
+                    isCountingDown = false
+                    onDone()
+                }
+            }
+        }
+
+        countdownRunnable = runnable
+        mainHandler.postDelayed(runnable, 1000)
+    }
+
+    private fun removeCountdownView() {
+        val v = countdownView ?: return
+
+        try {
+            windowManager?.removeView(v)
+        } catch (_: Exception) {
+        }
+
+        countdownView = null
+    }
+
+    private fun cancelCountdown() {
+        countdownRunnable?.let { mainHandler.removeCallbacks(it) }
+        countdownRunnable = null
+        removeCountdownView()
+        isCountingDown = false
+    }
+
+    private fun startShakeDetection() {
+        val enabled = getSharedPreferences("screenpro", MODE_PRIVATE)
+            .getBoolean("shake_to_stop", false)
+
+        if (!enabled || shakeListener != null) return
+
+        val sm = getSystemService(Context.SENSOR_SERVICE) as? SensorManager ?: return
+        val accel = sm.getDefaultSensor(Sensor.TYPE_ACCELEROMETER) ?: return
+
+        val listener = object : SensorEventListener {
+            override fun onSensorChanged(event: SensorEvent) {
+                val gx = event.values[0] / SensorManager.GRAVITY_EARTH
+                val gy = event.values[1] / SensorManager.GRAVITY_EARTH
+                val gz = event.values[2] / SensorManager.GRAVITY_EARTH
+                val g = kotlin.math.sqrt(gx * gx + gy * gy + gz * gz)
+
+                if (g < 2.7f) return
+
+                val now = SystemClock.elapsedRealtime()
+                if (now - lastShakeAt < 150) return
+                lastShakeAt = now
+
+                if (now - firstShakeAt > 1200) {
+                    firstShakeAt = now
+                    shakeCount = 1
+                } else {
+                    shakeCount++
+                }
+
+                if (shakeCount >= 4 && isRecording && !isStopping) {
+                    shakeCount = 0
+                    mainHandler.post {
+                        finishRecording()
+                        stopSelf()
+                    }
+                }
+            }
+
+            override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
+        }
+
+        sm.registerListener(listener, accel, SensorManager.SENSOR_DELAY_UI)
+        sensorManager = sm
+        shakeListener = listener
+    }
+
+    private fun stopShakeDetection() {
+        shakeListener?.let { sensorManager?.unregisterListener(it) }
+        shakeListener = null
+        sensorManager = null
+    }
+
+    private fun scheduleAutoCollapse() {
+        mainHandler.removeCallbacks(collapseRunnable)
+        mainHandler.postDelayed(collapseRunnable, 3000)
+    }
+
+    private fun applyDotState() {
+        val dot = dotView ?: return
+
+        dotAnimator?.cancel()
+        dotAnimator = null
+        dot.alpha = 1f
+
+        if (isPaused) {
+            dot.setTextColor(0xFF8A94A6.toInt())
+        } else {
+            dot.setTextColor(0xFFFF4D5A.toInt())
+
+            dotAnimator = ObjectAnimator.ofFloat(dot, "alpha", 1f, 0.25f).apply {
+                duration = 700
+                repeatMode = ValueAnimator.REVERSE
+                repeatCount = ValueAnimator.INFINITE
+                start()
+            }
+        }
+    }
+
+    private fun updateNotification() {
+        try {
+            getSystemService(NotificationManager::class.java)
+                .notify(NOTIFICATION_ID, buildNotification())
+        } catch (_: Exception) {
+        }
     }
 
     // FLOATING WIDGET
@@ -433,6 +720,9 @@ class RecordingService : Service() {
             buildExpandedWidget(panel)
             windowManager?.addView(panel, params)
 
+            mainHandler.removeCallbacks(tickRunnable)
+            mainHandler.post(tickRunnable)
+
         } catch (e: Exception) {
             e.printStackTrace()
             floatingWidget = null
@@ -479,6 +769,33 @@ class RecordingService : Service() {
         header.addView(collapseButton)
         panel.addView(header)
 
+        val timerRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            setPadding(0, 0, 0, dp(8))
+        }
+
+        val dot = TextView(this).apply {
+            text = "●"
+            textSize = 11f
+            setTextColor(0xFFFF4D5A.toInt())
+            setPadding(0, 0, dp(5), 0)
+        }
+
+        val timeView = TextView(this).apply {
+            text = formatElapsed(elapsedMs())
+            textSize = 13f
+            typeface = android.graphics.Typeface.DEFAULT_BOLD
+            setTextColor(Color.WHITE)
+        }
+
+        timerRow.addView(dot)
+        timerRow.addView(timeView)
+        panel.addView(timerRow)
+
+        dotView = dot
+        timerText = timeView
+
         pauseButton = Button(this).apply {
             text = if (isPaused) "▶" else "Ⅱ"
             textSize = 19f
@@ -523,11 +840,16 @@ class RecordingService : Service() {
 
         widgetCollapsed = false
         updateWidgetLayout()
+        applyDotState()
+        scheduleAutoCollapse()
     }
 
     private fun collapseWidget() {
         val panel = floatingWidget ?: return
         val params = widgetParams ?: return
+
+        mainHandler.removeCallbacks(collapseRunnable)
+        timerText = null
 
         panel.removeAllViews()
         panel.orientation = LinearLayout.HORIZONTAL
@@ -539,7 +861,7 @@ class RecordingService : Service() {
             text = "●"
             textSize = 22f
             gravity = Gravity.CENTER
-            setTextColor(Color.WHITE)
+            setTextColor(0xFFFF4D5A.toInt())
             background = rounded(0xEE172033.toInt(), 18)
             setPadding(dp(12), dp(12), dp(12), dp(12))
         }
@@ -599,6 +921,9 @@ class RecordingService : Service() {
 
         widgetCollapsed = true
         updateWidgetLayout()
+
+        dotView = tab
+        applyDotState()
     }
 
     private fun expandWidget() {
@@ -613,6 +938,7 @@ class RecordingService : Service() {
         return View.OnTouchListener { _, event ->
             when (event.action) {
                 MotionEvent.ACTION_DOWN -> {
+                    scheduleAutoCollapse()
                     initialTouchX = event.rawX
                     initialTouchY = event.rawY
                     initialWidgetX = params.x
@@ -621,6 +947,8 @@ class RecordingService : Service() {
                 }
 
                 MotionEvent.ACTION_MOVE -> {
+                    scheduleAutoCollapse()
+
                     params.x = initialWidgetX -
                         (event.rawX - initialTouchX).toInt()
 
@@ -660,6 +988,8 @@ class RecordingService : Service() {
                 if (isPaused) {
                     recorder.resume()
                     isPaused = false
+                    pausedTotal += SystemClock.elapsedRealtime() - pausedAt
+                    isPausedNow = false
                     pauseButton?.text = "Ⅱ"
 
                     Toast.makeText(
@@ -670,6 +1000,8 @@ class RecordingService : Service() {
                 } else {
                     recorder.pause()
                     isPaused = true
+                    pausedAt = SystemClock.elapsedRealtime()
+                    isPausedNow = true
                     pauseButton?.text = "▶"
 
                     Toast.makeText(
@@ -679,6 +1011,9 @@ class RecordingService : Service() {
                     ).show()
                 }
 
+                applyDotState()
+                updateNotification()
+                scheduleAutoCollapse()
                 sendRecordingState(true)
             } else {
                 Toast.makeText(
@@ -706,6 +1041,13 @@ class RecordingService : Service() {
         } catch (_: Exception) {
         }
 
+        mainHandler.removeCallbacks(collapseRunnable)
+        mainHandler.removeCallbacks(tickRunnable)
+        dotAnimator?.cancel()
+        dotAnimator = null
+        dotView = null
+        timerText = null
+
         floatingWidget = null
         pauseButton = null
         widgetParams = null
@@ -718,6 +1060,11 @@ class RecordingService : Service() {
         if (isStopping) return
 
         isStopping = true
+
+        cancelCountdown()
+        stopShakeDetection()
+        mainHandler.removeCallbacks(collapseRunnable)
+        mainHandler.removeCallbacks(tickRunnable)
 
         val wasRecording = isRecording
         var successfullySaved = false
@@ -733,6 +1080,8 @@ class RecordingService : Service() {
 
         isRecording = false
         isPaused = false
+        isActive = false
+        isPausedNow = false
 
         try {
             mediaRecorder?.reset()
@@ -815,15 +1164,78 @@ class RecordingService : Service() {
         foregroundStarted = false
     }
 
-    // NOTIFICATION: NO STOP ACTION BUTTON
+    // NOTIFICATION WITH PAUSE / STOP ACTIONS
 
     private fun buildNotification(): Notification {
-        return Notification.Builder(this, CHANNEL_ID)
+        val flags = PendingIntent.FLAG_UPDATE_CURRENT or
+            PendingIntent.FLAG_IMMUTABLE
+
+        val openIntent = PendingIntent.getActivity(
+            this,
+            0,
+            Intent(this, MainActivity::class.java).apply {
+                addFlags(
+                    Intent.FLAG_ACTIVITY_NEW_TASK or
+                        Intent.FLAG_ACTIVITY_SINGLE_TOP
+                )
+            },
+            flags
+        )
+
+        val pauseIntent = PendingIntent.getService(
+            this,
+            1,
+            Intent(this, RecordingService::class.java).apply {
+                action = ACTION_TOGGLE_PAUSE
+            },
+            flags
+        )
+
+        val stopIntent = PendingIntent.getService(
+            this,
+            2,
+            Intent(this, RecordingService::class.java).apply {
+                action = ACTION_STOP
+            },
+            flags
+        )
+
+        val builder = Notification.Builder(this, CHANNEL_ID)
             .setContentTitle("ScreenPro Recorder")
-            .setContentText("Your screen is being recorded")
+            .setContentText(
+                when {
+                    isPaused -> "Recording paused"
+                    isRecording -> "Your screen is being recorded"
+                    else -> "Starting…"
+                }
+            )
             .setSmallIcon(android.R.drawable.presence_video_online)
             .setOngoing(true)
-            .build()
+            .setContentIntent(openIntent)
+
+        if (isRecording) {
+            builder
+                .setWhen(System.currentTimeMillis() - elapsedMs())
+                .setShowWhen(true)
+                .setUsesChronometer(!isPaused)
+
+            @Suppress("DEPRECATION")
+            builder.addAction(
+                if (isPaused) android.R.drawable.ic_media_play
+                else android.R.drawable.ic_media_pause,
+                if (isPaused) "Resume" else "Pause",
+                pauseIntent
+            )
+        }
+
+        @Suppress("DEPRECATION")
+        builder.addAction(
+            android.R.drawable.ic_menu_close_clear_cancel,
+            "Stop",
+            stopIntent
+        )
+
+        return builder.build()
     }
 
     private fun createNotificationChannel() {
