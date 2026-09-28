@@ -14,13 +14,15 @@ import android.graphics.drawable.GradientDrawable
 import android.media.projection.MediaProjectionManager
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.os.SystemClock
 import android.view.Gravity
 import android.view.View
 import android.widget.Button
-import android.widget.Chronometer
 import android.widget.LinearLayout
 import android.widget.ScrollView
+import android.widget.Switch
 import android.widget.TextView
 import android.widget.Toast
 
@@ -28,7 +30,7 @@ class MainActivity : Activity() {
 
     private lateinit var projectionManager: MediaProjectionManager
     private lateinit var status: TextView
-    private lateinit var timer: Chronometer
+    private lateinit var timer: TextView
     private lateinit var startButton: Button
     private lateinit var stopButton: Button
     private lateinit var recordingsCount: TextView
@@ -39,11 +41,25 @@ class MainActivity : Activity() {
     private var recordingPaused = false
     private var receiverRegistered = false
     private var stopRequested = false
-    private var timerRunning = false
-    private var timerPaused = false
 
-    // Elapsed recording time preserved while the timer is paused.
-    private var elapsedBeforePause = 0L
+    private val uiHandler = Handler(Looper.getMainLooper())
+
+    // Timer is driven by the service's own clock, so it stays correct
+    // even if the app is closed and reopened during a recording.
+    private val tick = object : Runnable {
+        override fun run() {
+            if (recording && !recordingPaused) {
+                timer.text = RecordingService.formatElapsed(
+                    RecordingService.elapsedMs()
+                )
+                uiHandler.postDelayed(this, 300)
+            }
+        }
+    }
+
+    companion object {
+        const val EXTRA_AUTO_START = "screenpro_auto_start"
+    }
 
     private val receiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -72,6 +88,21 @@ class MainActivity : Activity() {
         createUi()
         setRecording(false, false)
         updateRecordingCount()
+        handleLaunchIntent(intent)
+    }
+
+    override fun onNewIntent(intent: Intent?) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleLaunchIntent(intent)
+    }
+
+    // Started from the Quick Settings tile.
+    private fun handleLaunchIntent(launch: Intent?) {
+        if (launch?.getBooleanExtra(EXTRA_AUTO_START, false) == true) {
+            launch.removeExtra(EXTRA_AUTO_START)
+            uiHandler.post { requestPermissionsAndCapture() }
+        }
     }
 
     override fun onResume() {
@@ -96,6 +127,8 @@ class MainActivity : Activity() {
             receiverRegistered = true
         }
 
+        // Re-sync with the service in case a recording is already running.
+        setRecording(RecordingService.isActive, RecordingService.isPausedNow)
         updateRecordingCount()
     }
 
@@ -275,14 +308,13 @@ class MainActivity : Activity() {
         statusHeader.addView(readyBadge)
         statusCard.addView(statusHeader)
 
-        timer = Chronometer(this).apply {
+        timer = TextView(this).apply {
             text = "00:00"
             textSize = 43f
             typeface = Typeface.DEFAULT_BOLD
             setTextColor(Color.WHITE)
             gravity = Gravity.CENTER
             setPadding(0, dp(24), 0, dp(4))
-            base = SystemClock.elapsedRealtime()
         }
 
         statusCard.addView(timer)
@@ -424,6 +456,13 @@ class MainActivity : Activity() {
         )
 
         page.addView(featureRow)
+
+        page.addView(
+            optionsCard(),
+            LinearLayout.LayoutParams(-1, -2).apply {
+                topMargin = dp(14)
+            }
+        )
 
         // RECORDINGS HEADER
 
@@ -610,6 +649,73 @@ class MainActivity : Activity() {
         )
 
         return card
+    }
+
+    // RECORDING OPTIONS (switches)
+
+    private fun optionsCard(): View {
+        val card = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(10), dp(16), dp(10))
+            background = rounded(Color.WHITE, 18)
+            elevation = dp(2).toFloat()
+        }
+
+        card.addView(
+            switchRow(
+                "3-2-1 countdown",
+                "Get ready before recording starts",
+                "countdown_enabled",
+                true
+            )
+        )
+
+        card.addView(
+            switchRow(
+                "Shake to stop",
+                "Shake your phone to end the recording",
+                "shake_to_stop",
+                false
+            )
+        )
+
+        return card
+    }
+
+    private fun switchRow(
+        title: String,
+        subtitle: String,
+        key: String,
+        default: Boolean
+    ): View {
+        val prefs = getSharedPreferences("screenpro", MODE_PRIVATE)
+
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(8), 0, dp(8))
+        }
+
+        val texts = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+        }
+
+        texts.addView(label(title, 14, 0xFF172033.toInt(), true))
+        texts.addView(label(subtitle, 11, 0xFF7A8497.toInt(), false))
+
+        row.addView(texts, LinearLayout.LayoutParams(0, -2, 1f))
+
+        val toggle = Switch(this).apply {
+            isChecked = prefs.getBoolean(key, default)
+
+            setOnCheckedChangeListener { _, checked ->
+                prefs.edit().putBoolean(key, checked).apply()
+            }
+        }
+
+        row.addView(toggle)
+
+        return row
     }
 
     // MICROPHONE SETTINGS
@@ -816,37 +922,12 @@ class MainActivity : Activity() {
                 stopButton.isEnabled = true
             }
 
-            if (!wasRecording) {
-                // New recording: start the timer from zero.
-                elapsedBeforePause = 0L
-                timer.base = SystemClock.elapsedRealtime()
-                timer.stop()
-                timerRunning = false
-                timerPaused = false
-            }
+            timer.text = RecordingService.formatElapsed(
+                RecordingService.elapsedMs()
+            )
 
-            if (paused) {
-                // Freeze the timer and preserve its elapsed time.
-                if (!timerPaused) {
-                    elapsedBeforePause =
-                        (SystemClock.elapsedRealtime() - timer.base)
-                            .coerceAtLeast(0L)
-
-                    timer.stop()
-                    timerRunning = false
-                    timerPaused = true
-                }
-            } else {
-                // Resume from the previously preserved elapsed time.
-                if (timerPaused || !timerRunning) {
-                    timer.base =
-                        SystemClock.elapsedRealtime() - elapsedBeforePause
-
-                    timer.start()
-                    timerRunning = true
-                    timerPaused = false
-                }
-            }
+            uiHandler.removeCallbacks(tick)
+            if (!paused) uiHandler.post(tick)
         } else {
             stopRequested = false
             stopButton.isEnabled = true
@@ -854,13 +935,8 @@ class MainActivity : Activity() {
             status.text = "Ready when you are"
             readyBadge.text = "READY"
 
-            timer.stop()
-            timer.base = SystemClock.elapsedRealtime()
+            uiHandler.removeCallbacks(tick)
             timer.text = "00:00"
-
-            timerRunning = false
-            timerPaused = false
-            elapsedBeforePause = 0L
 
             updateRecordingCount()
         }
@@ -869,7 +945,7 @@ class MainActivity : Activity() {
     // PERMISSIONS AND SCREEN CAPTURE
 
     private fun requestPermissionsAndCapture() {
-        if (recording) {
+        if (recording || RecordingService.isCountingDown) {
             Toast.makeText(
                 this,
                 "A recording is already active.",
