@@ -45,6 +45,59 @@ object RecordingStore {
         } catch (_: Exception) {}
     }
 
+    data class Item(
+        val uri: Uri,
+        val name: String,
+        val sizeBytes: Long,
+        val durationMs: Long,
+        val dateAddedSec: Long
+    )
+
+    /** Saved recordings (newest first) with the details the library shows. */
+    fun listItems(context: Context): List<Item> {
+        if (Build.VERSION.SDK_INT < 29) return emptyList()
+
+        val collection = MediaStore.Video.Media.EXTERNAL_CONTENT_URI
+
+        val projection = arrayOf(
+            MediaStore.Video.Media._ID,
+            MediaStore.Video.Media.DISPLAY_NAME,
+            MediaStore.Video.Media.SIZE,
+            MediaStore.Video.Media.DURATION,
+            MediaStore.Video.Media.DATE_ADDED
+        )
+
+        val selection = "${MediaStore.Video.Media.RELATIVE_PATH}=?"
+        val args = arrayOf(Environment.DIRECTORY_MOVIES + "/ScreenPro/")
+        val result = mutableListOf<Item>()
+
+        context.contentResolver.query(
+            collection,
+            projection,
+            selection,
+            args,
+            "${MediaStore.Video.Media.DATE_ADDED} DESC"
+        )?.use { c ->
+            val id = c.getColumnIndexOrThrow(MediaStore.Video.Media._ID)
+            val name = c.getColumnIndexOrThrow(MediaStore.Video.Media.DISPLAY_NAME)
+            val size = c.getColumnIndexOrThrow(MediaStore.Video.Media.SIZE)
+            val dur = c.getColumnIndexOrThrow(MediaStore.Video.Media.DURATION)
+            val date = c.getColumnIndexOrThrow(MediaStore.Video.Media.DATE_ADDED)
+
+            while (c.moveToNext()) {
+                result += Item(
+                    Uri.withAppendedPath(collection, c.getLong(id).toString()),
+                    c.getString(name) ?: "Recording",
+                    c.getLong(size),
+                    c.getLong(dur),
+                    c.getLong(date)
+                )
+            }
+        }
+
+        return result
+    }
+
     fun list(context: Context): List<Uri> {
         if (Build.VERSION.SDK_INT < 29) return emptyList()
         val collection = MediaStore.Video.Media.EXTERNAL_CONTENT_URI
