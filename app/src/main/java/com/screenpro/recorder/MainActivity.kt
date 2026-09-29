@@ -51,14 +51,16 @@ class MainActivity : Activity() {
     }
 
     // PALETTE
-    private val cBg = Color.parseColor("#0E1320")
-    private val cBar = Color.parseColor("#121A2B")
-    private val cCard = Color.parseColor("#182034")
-    private val cCard2 = Color.parseColor("#212B45")
-    private val cText = Color.parseColor("#F2F5FA")
-    private val cMuted = Color.parseColor("#8C97AD")
-    private val cAccent = Color.parseColor("#FF4D5A")
-    private val cOrange = Color.parseColor("#FF8A00")
+    private val cBg = Color.WHITE
+    private val cBar = Color.WHITE
+    private val cCard = Color.parseColor("#F5F6F8")
+    private val cCard2 = Color.parseColor("#FFF1EA")
+    private val cTint = Color.parseColor("#FFE6DA")
+    private val cText = Color.parseColor("#1F2430")
+    private val cMuted = Color.parseColor("#7B8496")
+    private val cAccent = Color.parseColor("#FF5722")
+    private val cOrange = Color.parseColor("#FF5722")
+    private val cGradientEnd = Color.parseColor("#FF8A50")
 
     private lateinit var projectionManager: MediaProjectionManager
     private val ui = Handler(Looper.getMainLooper())
@@ -154,6 +156,15 @@ class MainActivity : Activity() {
         window.statusBarColor = cBg
         window.navigationBarColor = cBar
 
+        @Suppress("DEPRECATION")
+        window.decorView.systemUiVisibility =
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR or
+                    View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR
+            } else {
+                View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR
+            }
+
         buildUi()
         showTab(0)
         render()
@@ -245,12 +256,12 @@ class MainActivity : Activity() {
         }
 
         header.addView(
-            label("Screen", 24, cText, true),
+            label("Screen", 24, cText, true).apply { typeface = Fonts.bold(this@MainActivity) },
             LinearLayout.LayoutParams(-2, -2)
         )
 
         header.addView(
-            label("Pro", 24, cAccent, true),
+            label("Pro", 24, cAccent, true).apply { typeface = Fonts.bold(this@MainActivity) },
             LinearLayout.LayoutParams(-2, -2)
         )
 
@@ -272,6 +283,7 @@ class MainActivity : Activity() {
         val bar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             setBackgroundColor(cBar)
+            elevation = dp(8).toFloat()
             setPadding(0, dp(8), 0, dp(8))
         }
 
@@ -304,7 +316,7 @@ class MainActivity : Activity() {
 
         tabViews.forEachIndexed { i, tab ->
             tab.setTextColor(if (i == index) cAccent else cMuted)
-            tab.typeface = if (i == index) Typeface.DEFAULT_BOLD else Typeface.DEFAULT
+            tab.typeface = if (i == index) Fonts.semiBold(this@MainActivity) else Fonts.medium(this@MainActivity)
         }
 
         if (index == 1) refreshLibrary()
@@ -326,7 +338,7 @@ class MainActivity : Activity() {
 
         statusChip = TextView(this).apply {
             textSize = 12f
-            typeface = Typeface.DEFAULT_BOLD
+            typeface = Fonts.bold(this@MainActivity)
             gravity = Gravity.CENTER
             setPadding(dp(16), dp(6), dp(16), dp(6))
         }
@@ -338,7 +350,7 @@ class MainActivity : Activity() {
         timerView = TextView(this).apply {
             text = "00:00"
             textSize = 58f
-            typeface = Typeface.DEFAULT_BOLD
+            typeface = Fonts.bold(this@MainActivity)
             setTextColor(cText)
             gravity = Gravity.CENTER
             letterSpacing = 0.03f
@@ -374,7 +386,7 @@ class MainActivity : Activity() {
         val circle = View(this).apply {
             background = GradientDrawable(
                 GradientDrawable.Orientation.TL_BR,
-                intArrayOf(cAccent, cOrange)
+                intArrayOf(cAccent, cGradientEnd)
             ).apply { shape = GradientDrawable.OVAL }
             elevation = dp(8).toFloat()
         }
@@ -405,8 +417,8 @@ class MainActivity : Activity() {
 
         pauseButton = TextView(this).apply {
             textSize = 14f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(cText)
+            typeface = Fonts.bold(this@MainActivity)
+            setTextColor(cAccent)
             gravity = Gravity.CENTER
             setPadding(dp(28), dp(11), dp(28), dp(11))
             background = rounded(cCard2, 26)
@@ -427,7 +439,7 @@ class MainActivity : Activity() {
         warnCard = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(16), dp(14), dp(16), dp(14))
-            background = rounded(Color.parseColor("#2A2313"), 16)
+            background = rounded(Color.parseColor("#FFF3E8"), 16)
         }
 
         warnCard.addView(label("Floating controls are off", 14, cOrange, true))
@@ -444,7 +456,7 @@ class MainActivity : Activity() {
             TextView(this).apply {
                 text = "Enable"
                 textSize = 13f
-                typeface = Typeface.DEFAULT_BOLD
+                typeface = Fonts.bold(this@MainActivity)
                 setTextColor(Color.WHITE)
                 gravity = Gravity.CENTER
                 setPadding(dp(20), dp(9), dp(20), dp(9))
@@ -523,7 +535,7 @@ class MainActivity : Activity() {
                 setColor(if (active) cCard2 else cCard)
                 cornerRadius = dp(18).toFloat()
 
-                if (active) setStroke(dp(1), Color.parseColor("#55FF4D5A"))
+                if (active) setStroke(dp(1), Color.parseColor("#66FF5722"))
             }
 
             addView(label(emoji, 22, cText, false))
@@ -690,7 +702,7 @@ class MainActivity : Activity() {
         return TextView(this).apply {
             this.text = text
             textSize = 13f
-            typeface = Typeface.DEFAULT_BOLD
+            typeface = Fonts.bold(this@MainActivity)
             setTextColor(color)
             gravity = Gravity.CENTER
             setPadding(0, dp(10), 0, dp(10))
@@ -805,14 +817,14 @@ class MainActivity : Activity() {
         settingsHolder.addView(sectionTitle("AUDIO"))
         settingsHolder.addView(
             card(
-                settingRow("Audio source", audioLabel()) { chooseAudioSource() }
+                settingRow("🎙", "Audio source", audioLabel()) { chooseAudioSource() }
             )
         )
 
         settingsHolder.addView(sectionTitle("VIDEO"))
         settingsHolder.addView(
             card(
-                settingRow("Resolution", prefs.getString("resolution", "1080p") ?: "1080p") {
+                settingRow("🖥", "Resolution", prefs.getString("resolution", "1080p") ?: "1080p") {
                     choose(
                         "Resolution",
                         listOf("720p", "1080p", "1440p", "Native"),
@@ -820,7 +832,7 @@ class MainActivity : Activity() {
                     ) { prefs.edit().putString("resolution", it).apply() }
                 },
                 divider(),
-                settingRow("Quality", "${prefs.getInt("bitrate_mbps", 8)} Mbps") {
+                settingRow("✨", "Quality", "${prefs.getInt("bitrate_mbps", 8)} Mbps") {
                     choose(
                         "Quality (bitrate)",
                         listOf("4 Mbps", "8 Mbps", "12 Mbps", "16 Mbps"),
@@ -830,7 +842,7 @@ class MainActivity : Activity() {
                     }
                 },
                 divider(),
-                settingRow("Frame rate", "${prefs.getInt("fps", 30)} fps") {
+                settingRow("🎞", "Frame rate", "${prefs.getInt("fps", 30)} fps") {
                     choose(
                         "Frame rate",
                         listOf("24 fps", "30 fps", "60 fps"),
@@ -845,11 +857,11 @@ class MainActivity : Activity() {
         settingsHolder.addView(sectionTitle("CONTROLS"))
         settingsHolder.addView(
             card(
-                switchRow("3-2-1 countdown", "Get ready before recording starts", "countdown_enabled", true),
+                switchRow("⏱", "3-2-1 countdown", "Get ready before recording starts", "countdown_enabled", true),
                 divider(),
-                switchRow("Floating ball", "Timer, pause, screenshot and pen on top of any app", "floating_ball", true),
+                switchRow("🫧", "Floating ball", "Timer, pause, screenshot and pen on top of any app", "floating_ball", true),
                 divider(),
-                switchRow("Shake to stop", "Shake your phone to end the recording", "shake_to_stop", false)
+                switchRow("📳", "Shake to stop", "Shake your phone to end the recording", "shake_to_stop", false)
             )
         )
 
@@ -857,6 +869,7 @@ class MainActivity : Activity() {
         settingsHolder.addView(
             card(
                 settingRow(
+                    "🛡",
                     "Display over other apps",
                     if (canOverlay()) "Allowed" else "Tap to allow"
                 ) { openOverlaySettings() }
@@ -882,28 +895,49 @@ class MainActivity : Activity() {
 
     private fun divider(): View {
         return View(this).apply {
-            setBackgroundColor(Color.parseColor("#26FFFFFF"))
+            setBackgroundColor(Color.parseColor("#14000000"))
             layoutParams = LinearLayout.LayoutParams(-1, dp(1))
         }
     }
 
-    private fun settingRow(title: String, value: String, onClick: () -> Unit): View {
+    private fun iconBadge(emoji: String): View {
+        return TextView(this).apply {
+            text = emoji
+            textSize = 16f
+            gravity = Gravity.CENTER
+            includeFontPadding = false
+            background = rounded(cTint, 10)
+            layoutParams = LinearLayout.LayoutParams(dp(36), dp(36)).apply {
+                marginEnd = dp(14)
+            }
+        }
+    }
+
+    private fun settingRow(
+        icon: String,
+        title: String,
+        value: String,
+        onClick: () -> Unit
+    ): View {
         return LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, dp(14), 0, dp(14))
+            setPadding(0, dp(12), 0, dp(12))
+
+            addView(iconBadge(icon))
 
             addView(
-                label(title, 14, cText, false),
+                label(title, 14, cText, false).apply { typeface = Fonts.medium(this@MainActivity) },
                 LinearLayout.LayoutParams(0, -2, 1f)
             )
 
-            addView(label(value, 14, cOrange, true))
+            addView(label(value, 13, cOrange, true))
             setOnClickListener { onClick() }
         }
     }
 
     private fun switchRow(
+        icon: String,
         title: String,
         subtitle: String,
         key: String,
@@ -912,8 +946,10 @@ class MainActivity : Activity() {
         val row = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, dp(12), 0, dp(12))
+            setPadding(0, dp(10), 0, dp(10))
         }
+
+        row.addView(iconBadge(icon))
 
         val texts = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -936,12 +972,12 @@ class MainActivity : Activity() {
 
             thumbTintList = ColorStateList(
                 states,
-                intArrayOf(cAccent, Color.parseColor("#B0B7C6"))
+                intArrayOf(cAccent, Color.WHITE)
             )
 
             trackTintList = ColorStateList(
                 states,
-                intArrayOf(Color.parseColor("#80FF4D5A"), Color.parseColor("#3A4256"))
+                intArrayOf(Color.parseColor("#80FF5722"), Color.parseColor("#D5D9E2"))
             )
 
             setOnCheckedChangeListener { _, checked ->
@@ -957,7 +993,7 @@ class MainActivity : Activity() {
     // CHOICES
 
     private fun dialog(): AlertDialog.Builder {
-        return AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
+        return AlertDialog.Builder(this, android.R.style.Theme_Material_Light_Dialog_Alert)
     }
 
     private fun choose(
@@ -1051,7 +1087,7 @@ class MainActivity : Activity() {
             saving -> Pair("SAVING…", cOrange)
             recording && paused -> Pair("PAUSED", cOrange)
             recording -> Pair("● RECORDING", cAccent)
-            else -> Pair("READY", Color.parseColor("#30D158"))
+            else -> Pair("READY", Color.parseColor("#1FA35B"))
         }
 
         statusChip.text = text
@@ -1290,7 +1326,8 @@ class MainActivity : Activity() {
             this.text = text
             textSize = sp.toFloat()
             setTextColor(color)
-            if (bold) typeface = Typeface.DEFAULT_BOLD
+            includeFontPadding = false
+            typeface = if (bold) Fonts.semiBold(this@MainActivity) else Fonts.regular(this@MainActivity)
         }
     }
 

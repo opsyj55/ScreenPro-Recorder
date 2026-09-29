@@ -195,7 +195,7 @@ class FloatingBall(
         return TextView(context).apply {
             text = timeText
             textSize = if (timeText.length > 5) 10f else 13f
-            typeface = Typeface.DEFAULT_BOLD
+            typeface = Fonts.bold(context)
             setTextColor(Color.WHITE)
             gravity = Gravity.CENTER
             setOnTouchListener(dragListener())

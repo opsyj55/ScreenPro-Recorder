@@ -741,7 +741,7 @@ class RecordingService : Service() {
         val tv = TextView(this).apply {
             text = seconds.toString()
             textSize = 84f
-            typeface = Typeface.DEFAULT_BOLD
+            typeface = Fonts.bold(this@RecordingService)
             gravity = Gravity.CENTER
             setTextColor(Color.WHITE)
             background = GradientDrawable().apply {
