@@ -1,22 +1,21 @@
 package com.screenpro.recorder
 
-import android.Manifest
 import android.app.Activity
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
-import android.app.Service
-import android.animation.ObjectAnimator
-import android.animation.ValueAnimator
 import android.app.PendingIntent
+import android.app.Service
 import android.content.ComponentName
 import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
+import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.PixelFormat
+import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.hardware.Sensor
 import android.hardware.SensorEvent
@@ -24,6 +23,7 @@ import android.hardware.SensorEventListener
 import android.hardware.SensorManager
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
+import android.media.ImageReader
 import android.media.MediaRecorder
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
@@ -37,13 +37,11 @@ import android.os.SystemClock
 import android.provider.MediaStore
 import android.service.quicksettings.TileService
 import android.view.Gravity
-import android.view.MotionEvent
-import android.view.View
+import android.view.Surface
 import android.view.WindowManager
-import android.widget.Button
-import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
+import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -53,20 +51,20 @@ class RecordingService : Service() {
     companion object {
         const val ACTION_START = "com.screenpro.recorder.START"
         const val ACTION_STOP = "com.screenpro.recorder.STOP"
+        const val ACTION_TOGGLE_PAUSE = "com.screenpro.recorder.TOGGLE_PAUSE"
         const val ACTION_STATE_CHANGED =
             "com.screenpro.recorder.ACTION_STATE_CHANGED"
+        const val ACTION_SAVED = "com.screenpro.recorder.ACTION_SAVED"
 
         const val EXTRA_RESULT_CODE = "result_code"
         const val EXTRA_RESULT_DATA = "result_data"
         const val EXTRA_IS_RECORDING = "is_recording"
         const val EXTRA_IS_PAUSED = "is_paused"
-
-        const val ACTION_TOGGLE_PAUSE = "com.screenpro.recorder.TOGGLE_PAUSE"
+        const val EXTRA_SAVED = "saved"
 
         private const val NOTIFICATION_ID = 1001
         private const val CHANNEL_ID = "screenpro_recording"
 
-        // Live state so the UI, tile and notification can always sync up.
         @Volatile var isActive = false
         @Volatile var isPausedNow = false
         @Volatile var isCountingDown = false
@@ -86,34 +84,55 @@ class RecordingService : Service() {
             val h = total / 3600
             val m = (total % 3600) / 60
             val sec = total % 60
+
             return if (h > 0) {
                 String.format(Locale.US, "%d:%02d:%02d", h, m, sec)
             } else {
                 String.format(Locale.US, "%02d:%02d", m, sec)
             }
         }
+
+        /** "mic", "internal", "both" or "none". */
+        fun audioSource(ctx: Context): String {
+            val prefs = ctx.getSharedPreferences("screenpro", MODE_PRIVATE)
+
+            val saved = prefs.getString("audio_source", null)
+                ?: if (prefs.getBoolean("microphone_enabled", true)) "mic" else "none"
+
+            return if (
+                Build.VERSION.SDK_INT < Build.VERSION_CODES.Q &&
+                (saved == "internal" || saved == "both")
+            ) {
+                "mic"
+            } else {
+                saved
+            }
+        }
     }
 
     private var mediaRecorder: MediaRecorder? = null
+    private var recorderSurface: Surface? = null
     private var mediaProjection: MediaProjection? = null
     private var virtualDisplay: VirtualDisplay? = null
-    private var outputUri: Uri? = null
-    private var outputDescriptor: ParcelFileDescriptor? = null
+
+    private var tmpUri: Uri? = null
+    private var tmpDescriptor: ParcelFileDescriptor? = null
+    private var finalName = ""
+    private var recWidth = 0
+    private var recHeight = 0
+
+    private var audioCapture: AudioCapture? = null
+    private var audioFile: File? = null
 
     private var isRecording = false
     private var isPaused = false
     private var isStopping = false
     private var foregroundStarted = false
+    private var shotInProgress = false
 
     private var windowManager: WindowManager? = null
-    private var floatingWidget: LinearLayout? = null
-    private var pauseButton: Button? = null
-    private var widgetParams: WindowManager.LayoutParams? = null
-    private var widgetCollapsed = false
-
-    private var timerText: TextView? = null
-    private var dotView: TextView? = null
-    private var dotAnimator: ObjectAnimator? = null
+    private var ball: FloatingBall? = null
+    private var draw: DrawOverlay? = null
 
     private var countdownView: TextView? = null
     private var countdownRunnable: Runnable? = null
@@ -124,29 +143,19 @@ class RecordingService : Service() {
     private var lastShakeAt = 0L
     private var shakeCount = 0
 
+    private lateinit var projectionManager: MediaProjectionManager
+    private val mainHandler = Handler(Looper.getMainLooper())
+
     private val tickRunnable = object : Runnable {
         override fun run() {
-            timerText?.text = formatElapsed(elapsedMs())
+            ball?.update(formatElapsed(elapsedMs()), isPaused)
             if (isRecording) mainHandler.postDelayed(this, 500)
         }
     }
 
-    private val collapseRunnable = Runnable {
-        if (isRecording && !widgetCollapsed) collapseWidget()
-    }
-
-    private var initialTouchX = 0f
-    private var initialTouchY = 0f
-    private var initialWidgetX = 0
-    private var initialWidgetY = 0
-
-    private lateinit var projectionManager: MediaProjectionManager
-    private val mainHandler = Handler(Looper.getMainLooper())
-
     private val projectionCallback = object : MediaProjection.Callback() {
         override fun onStop() {
             finishRecording()
-            stopSelf()
         }
     }
 
@@ -157,8 +166,7 @@ class RecordingService : Service() {
             getSystemService(Context.MEDIA_PROJECTION_SERVICE)
                     as MediaProjectionManager
 
-        windowManager =
-            getSystemService(Context.WINDOW_SERVICE) as WindowManager
+        windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
 
         createNotificationChannel()
     }
@@ -170,17 +178,14 @@ class RecordingService : Service() {
     ): Int {
         when (intent?.action) {
             ACTION_START -> handleStart(intent)
-
-            ACTION_STOP -> {
-                finishRecording()
-                stopSelf()
-            }
-
+            ACTION_STOP -> finishRecording()
             ACTION_TOGGLE_PAUSE -> togglePause()
         }
 
         return START_NOT_STICKY
     }
+
+    // START
 
     private fun handleStart(intent: Intent) {
         if (isRecording || isStopping || isCountingDown) return
@@ -192,10 +197,7 @@ class RecordingService : Service() {
 
         val resultData: Intent? =
             if (Build.VERSION.SDK_INT >= 33) {
-                intent.getParcelableExtra(
-                    EXTRA_RESULT_DATA,
-                    Intent::class.java
-                )
+                intent.getParcelableExtra(EXTRA_RESULT_DATA, Intent::class.java)
             } else {
                 @Suppress("DEPRECATION")
                 intent.getParcelableExtra(EXTRA_RESULT_DATA)
@@ -207,16 +209,12 @@ class RecordingService : Service() {
             return
         }
 
-        val micEnabled = getSharedPreferences(
-            "screenpro",
-            MODE_PRIVATE
-        ).getBoolean("microphone_enabled", true)
-
         if (
-            micEnabled &&
-            checkSelfPermission(Manifest.permission.RECORD_AUDIO) !=
+            audioSource(this) != "none" &&
+            checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) !=
             PackageManager.PERMISSION_GRANTED
         ) {
+            toast("Microphone permission is needed for audio. Allow it and try again.")
             sendRecordingState(false)
             stopSelf()
             return
@@ -227,8 +225,8 @@ class RecordingService : Service() {
             beginWithCountdown(resultCode, resultData)
         } catch (e: Exception) {
             e.printStackTrace()
+            toast("Could not start: ${e.message}")
             finishRecording()
-            stopSelf()
         }
     }
 
@@ -236,246 +234,23 @@ class RecordingService : Service() {
         val notification = buildNotification()
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            var serviceType =
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+            var type = ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
 
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                val micEnabled = getSharedPreferences(
-                    "screenpro",
-                    MODE_PRIVATE
-                ).getBoolean("microphone_enabled", true)
+            val source = audioSource(this)
 
-                if (micEnabled) {
-                    serviceType =
-                        serviceType or
-                        ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
-                }
+            if (
+                Build.VERSION.SDK_INT >= Build.VERSION_CODES.R &&
+                (source == "mic" || source == "both")
+            ) {
+                type = type or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
             }
 
-            startForeground(
-                NOTIFICATION_ID,
-                notification,
-                serviceType
-            )
+            startForeground(NOTIFICATION_ID, notification, type)
         } else {
             startForeground(NOTIFICATION_ID, notification)
         }
 
         foregroundStarted = true
-    }
-
-    private fun startRecording(
-        resultCode: Int,
-        resultData: Intent
-    ) {
-        isStopping = false
-        isPaused = false
-
-        val prefs = getSharedPreferences(
-            "screenpro",
-            MODE_PRIVATE
-        )
-
-        val micEnabled = prefs.getBoolean(
-            "microphone_enabled",
-            true
-        )
-
-        val quality = prefs.getString(
-            "video_quality",
-            "HD"
-        ) ?: "HD"
-
-        val metrics = android.util.DisplayMetrics()
-
-        @Suppress("DEPRECATION")
-        val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
-
-        @Suppress("DEPRECATION")
-        wm.defaultDisplay.getRealMetrics(metrics)
-
-        val screenWidth = metrics.widthPixels
-        val screenHeight = metrics.heightPixels
-        val density = metrics.densityDpi
-
-        val dimensions = chooseVideoSize(
-            screenWidth,
-            screenHeight,
-            quality
-        )
-
-        val width = dimensions.first
-        val height = dimensions.second
-
-        val filename = "ScreenPro_" +
-            SimpleDateFormat(
-                "yyyyMMdd_HHmmss",
-                Locale.US
-            ).format(Date()) + ".mp4"
-
-        val contentValues = ContentValues().apply {
-            put(MediaStore.Video.Media.DISPLAY_NAME, filename)
-            put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
-
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                put(
-                    MediaStore.Video.Media.RELATIVE_PATH,
-                    "Movies/ScreenPro"
-                )
-                put(MediaStore.Video.Media.IS_PENDING, 1)
-            }
-        }
-
-        outputUri = contentResolver.insert(
-            MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
-            contentValues
-        ) ?: throw IllegalStateException("Could not create video file")
-
-        outputDescriptor =
-            contentResolver.openFileDescriptor(outputUri!!, "w")
-                ?: throw IllegalStateException("Could not open video file")
-
-        mediaRecorder =
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                MediaRecorder(this)
-            } else {
-                @Suppress("DEPRECATION")
-                MediaRecorder()
-            }
-
-        mediaRecorder?.apply {
-            if (micEnabled) {
-                setAudioSource(MediaRecorder.AudioSource.MIC)
-            }
-
-            setVideoSource(MediaRecorder.VideoSource.SURFACE)
-            setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
-            setVideoEncoder(MediaRecorder.VideoEncoder.H264)
-
-            if (micEnabled) {
-                setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
-                setAudioEncodingBitRate(128_000)
-                setAudioSamplingRate(44100)
-            }
-
-            setVideoSize(width, height)
-            setVideoFrameRate(30)
-
-            val videoBitrate = when (quality) {
-                "Standard" -> 3_000_000
-                "Maximum" -> 8_000_000
-                else -> 5_000_000
-            }
-
-            setVideoEncodingBitRate(videoBitrate)
-            setOutputFile(outputDescriptor!!.fileDescriptor)
-            prepare()
-        }
-
-        mediaProjection = projectionManager.getMediaProjection(
-            resultCode,
-            resultData
-        ) ?: throw IllegalStateException("Could not start screen capture")
-
-        mediaProjection?.registerCallback(
-            projectionCallback,
-            mainHandler
-        )
-
-        virtualDisplay = mediaProjection?.createVirtualDisplay(
-            "ScreenProRecorder",
-            width,
-            height,
-            density,
-            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-            mediaRecorder?.surface,
-            null,
-            mainHandler
-        ) ?: throw IllegalStateException("Could not create virtual display")
-
-        mediaRecorder?.start()
-
-        isRecording = true
-        isPaused = false
-
-        startedAt = SystemClock.elapsedRealtime()
-        pausedAt = 0L
-        pausedTotal = 0L
-        isPausedNow = false
-        isActive = true
-
-        updateNotification()
-        startShakeDetection()
-        showFloatingWidget()
-        sendRecordingState(true)
-    }
-
-    private fun chooseVideoSize(
-        screenWidth: Int,
-        screenHeight: Int,
-        quality: String
-    ): Pair<Int, Int> {
-        val longer = maxOf(
-            screenWidth,
-            screenHeight
-        ).toFloat()
-
-        val targetLongSide = when (quality) {
-            "Standard" -> 1280f
-            "HD" -> 1920f
-            else -> longer
-        }
-
-        val scale = minOf(1f, targetLongSide / longer)
-
-        var width = (screenWidth * scale).toInt()
-        var height = (screenHeight * scale).toInt()
-
-        width = (width / 2) * 2
-        height = (height / 2) * 2
-
-        if (width < 2 || height < 2) {
-            width = screenWidth
-            height = screenHeight
-        }
-
-        return Pair(width, height)
-    }
-
-    private fun sendRecordingState(recording: Boolean) {
-        val stateIntent = Intent(ACTION_STATE_CHANGED).apply {
-            setPackage(packageName)
-            putExtra(EXTRA_IS_RECORDING, recording)
-            putExtra(EXTRA_IS_PAUSED, isPaused)
-        }
-
-        sendBroadcast(stateIntent)
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-            try {
-                TileService.requestListeningState(
-                    this,
-                    ComponentName(this, RecordingTileService::class.java)
-                )
-            } catch (_: Exception) {
-            }
-        }
-    }
-
-    // COUNTDOWN, SHAKE, DOT, NOTIFICATION HELPERS
-
-    private fun canOverlay(): Boolean {
-        return Build.VERSION.SDK_INT < Build.VERSION_CODES.M ||
-            android.provider.Settings.canDrawOverlays(this)
-    }
-
-    private fun overlayType(): Int {
-        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
-        } else {
-            @Suppress("DEPRECATION")
-            WindowManager.LayoutParams.TYPE_PHONE
-        }
     }
 
     private fun beginWithCountdown(resultCode: Int, resultData: Intent) {
@@ -494,16 +269,479 @@ class RecordingService : Service() {
             startRecording(resultCode, resultData)
         } catch (e: Exception) {
             e.printStackTrace()
+            toast("Could not start recording: ${e.message}")
             finishRecording()
-            stopSelf()
         }
     }
+
+    private fun startRecording(resultCode: Int, resultData: Intent) {
+        isStopping = false
+        isPaused = false
+
+        val prefs = getSharedPreferences("screenpro", MODE_PRIVATE)
+
+        val source = audioSource(this)
+        val useMic = source == "mic" || source == "both"
+        val useInternal = source == "internal" || source == "both"
+        val wantsAudio = useMic || useInternal
+
+        val resolution = prefs.getString("resolution", "1080p") ?: "1080p"
+        val mbps = prefs.getInt("bitrate_mbps", 8)
+        val fps = prefs.getInt("fps", 30)
+
+        val metrics = android.util.DisplayMetrics()
+
+        @Suppress("DEPRECATION")
+        val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+
+        @Suppress("DEPRECATION")
+        wm.defaultDisplay.getRealMetrics(metrics)
+
+        val (width, height) = chooseVideoSize(
+            metrics.widthPixels,
+            metrics.heightPixels,
+            resolution
+        )
+
+        recWidth = width
+        recHeight = height
+
+        val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+        finalName = "ScreenPro_$stamp.mp4"
+
+        // With audio, the video is saved under a temporary name first and then
+        // joined with the audio track when recording ends.
+        val entryName = if (wantsAudio) "ScreenPro_tmp_$stamp.mp4" else finalName
+
+        val uri = insertVideoEntry(entryName)
+        tmpUri = uri
+
+        tmpDescriptor = contentResolver.openFileDescriptor(uri, "w")
+            ?: throw IllegalStateException("Could not open video file")
+
+        mediaRecorder =
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                MediaRecorder(this)
+            } else {
+                @Suppress("DEPRECATION")
+                MediaRecorder()
+            }
+
+        mediaRecorder?.apply {
+            setVideoSource(MediaRecorder.VideoSource.SURFACE)
+            setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
+            setVideoEncoder(MediaRecorder.VideoEncoder.H264)
+            setVideoSize(width, height)
+            setVideoFrameRate(fps)
+            setVideoEncodingBitRate(mbps * 1_000_000)
+            setOutputFile(tmpDescriptor!!.fileDescriptor)
+            prepare()
+        }
+
+        recorderSurface = mediaRecorder?.surface
+
+        mediaProjection = projectionManager.getMediaProjection(
+            resultCode,
+            resultData
+        ) ?: throw IllegalStateException("Could not start screen capture")
+
+        mediaProjection?.registerCallback(projectionCallback, mainHandler)
+
+        virtualDisplay = mediaProjection?.createVirtualDisplay(
+            "ScreenProRecorder",
+            width,
+            height,
+            metrics.densityDpi,
+            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+            recorderSurface,
+            null,
+            mainHandler
+        ) ?: throw IllegalStateException("Could not create virtual display")
+
+        if (wantsAudio) startAudio(useMic, useInternal)
+
+        mediaRecorder?.start()
+
+        isRecording = true
+        isPaused = false
+
+        startedAt = SystemClock.elapsedRealtime()
+        pausedAt = 0L
+        pausedTotal = 0L
+        isPausedNow = false
+        isActive = true
+
+        updateNotification()
+        startShakeDetection()
+        showFloatingBall()
+        sendRecordingState(true)
+    }
+
+    private fun startAudio(useMic: Boolean, useInternal: Boolean) {
+        val file = File(cacheDir, "audio_${System.currentTimeMillis()}.m4a")
+
+        try {
+            val capture = AudioCapture(
+                useMic,
+                useInternal,
+                mediaProjection,
+                file
+            )
+
+            capture.onError = { msg ->
+                toast("Audio stopped: $msg")
+            }
+
+            capture.prepare()
+            capture.start()
+
+            audioCapture = capture
+            audioFile = file
+        } catch (e: Exception) {
+            e.printStackTrace()
+            file.delete()
+            audioCapture = null
+            audioFile = null
+            toast("Audio unavailable: ${e.message}. Recording video only.")
+        }
+    }
+
+    private fun chooseVideoSize(
+        screenWidth: Int,
+        screenHeight: Int,
+        resolution: String
+    ): Pair<Int, Int> {
+        val longer = maxOf(screenWidth, screenHeight).toFloat()
+
+        val target = when (resolution) {
+            "720p" -> 1280f
+            "1080p" -> 1920f
+            "1440p" -> 2560f
+            else -> longer
+        }
+
+        val scale = minOf(1f, target / longer)
+
+        var width = ((screenWidth * scale).toInt() / 2) * 2
+        var height = ((screenHeight * scale).toInt() / 2) * 2
+
+        if (width < 2 || height < 2) {
+            width = screenWidth
+            height = screenHeight
+        }
+
+        return Pair(width, height)
+    }
+
+    private fun insertVideoEntry(name: String): Uri {
+        val values = ContentValues().apply {
+            put(MediaStore.Video.Media.DISPLAY_NAME, name)
+            put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/ScreenPro")
+                put(MediaStore.Video.Media.IS_PENDING, 1)
+            }
+        }
+
+        return contentResolver.insert(
+            MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
+            values
+        ) ?: throw IllegalStateException("Could not create video file")
+    }
+
+    // PAUSE
+
+    private fun togglePause() {
+        val recorder = mediaRecorder ?: return
+
+        if (!isRecording || Build.VERSION.SDK_INT < Build.VERSION_CODES.N) {
+            return
+        }
+
+        try {
+            if (isPaused) {
+                recorder.resume()
+                audioCapture?.resume()
+                isPaused = false
+                pausedTotal += SystemClock.elapsedRealtime() - pausedAt
+                isPausedNow = false
+            } else {
+                recorder.pause()
+                audioCapture?.pause()
+                isPaused = true
+                pausedAt = SystemClock.elapsedRealtime()
+                isPausedNow = true
+            }
+
+            ball?.update(formatElapsed(elapsedMs()), isPaused)
+            updateNotification()
+            sendRecordingState(true)
+        } catch (e: Exception) {
+            e.printStackTrace()
+            toast("Could not pause: ${e.message}")
+        }
+    }
+
+    // STATE BROADCASTS
+
+    private fun sendRecordingState(recording: Boolean) {
+        sendBroadcast(
+            Intent(ACTION_STATE_CHANGED).apply {
+                setPackage(packageName)
+                putExtra(EXTRA_IS_RECORDING, recording)
+                putExtra(EXTRA_IS_PAUSED, isPaused)
+            }
+        )
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            try {
+                TileService.requestListeningState(
+                    this,
+                    ComponentName(this, RecordingTileService::class.java)
+                )
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    private fun sendSaved(saved: Boolean) {
+        sendBroadcast(
+            Intent(ACTION_SAVED).apply {
+                setPackage(packageName)
+                putExtra(EXTRA_SAVED, saved)
+            }
+        )
+    }
+
+    // OVERLAYS
+
+    private fun canOverlay(): Boolean {
+        return Build.VERSION.SDK_INT < Build.VERSION_CODES.M ||
+            android.provider.Settings.canDrawOverlays(this)
+    }
+
+    private fun overlayType(): Int {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+        } else {
+            @Suppress("DEPRECATION")
+            WindowManager.LayoutParams.TYPE_PHONE
+        }
+    }
+
+    private fun showFloatingBall() {
+        val enabled = getSharedPreferences("screenpro", MODE_PRIVATE)
+            .getBoolean("floating_ball", true)
+
+        val wm = windowManager
+
+        if (!enabled || wm == null || !canOverlay()) return
+
+        val b = FloatingBall(
+            this,
+            wm,
+            overlayType(),
+            onStop = { finishRecording() },
+            onTogglePause = { togglePause() },
+            onScreenshot = { takeScreenshot() },
+            onBrush = { toggleBrush() }
+        )
+
+        b.show()
+        ball = b
+
+        mainHandler.removeCallbacks(tickRunnable)
+        mainHandler.post(tickRunnable)
+    }
+
+    private fun toggleBrush() {
+        val wm = windowManager ?: return
+
+        val overlay = draw ?: DrawOverlay(this, wm, overlayType()) {
+            ball?.setBrushActive(false)
+        }.also { draw = it }
+
+        if (overlay.isShowing) {
+            overlay.hide()
+            ball?.setBrushActive(false)
+        } else {
+            overlay.show()
+            ball?.setBrushActive(true)
+            ball?.bringToFront()
+        }
+    }
+
+    // SCREENSHOT
+    //
+    // Android 14 only allows one virtual display per screen-capture session,
+    // so we briefly point the same display at an ImageReader, grab one frame,
+    // then point it back at the video recorder.
+
+    private fun takeScreenshot() {
+        if (!isRecording || shotInProgress) return
+
+        shotInProgress = true
+        ball?.hideTemporarily()
+        draw?.setToolbarVisible(false)
+
+        mainHandler.postDelayed({ captureFrame() }, 220)
+    }
+
+    private fun captureFrame() {
+        val display = virtualDisplay
+        val recSurface = recorderSurface
+
+        if (display == null || recSurface == null || !isRecording) {
+            endScreenshot(null, "Screenshot failed")
+            return
+        }
+
+        val reader = ImageReader.newInstance(
+            recWidth,
+            recHeight,
+            PixelFormat.RGBA_8888,
+            2
+        )
+
+        var finished = false
+
+        fun finish(bitmap: Bitmap?, error: String?) {
+            if (finished) return
+            finished = true
+
+            try {
+                display.setSurface(recSurface)
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+
+            try {
+                reader.close()
+            } catch (_: Exception) {
+            }
+
+            endScreenshot(bitmap, error)
+        }
+
+        reader.setOnImageAvailableListener({ r ->
+            if (finished) return@setOnImageAvailableListener
+
+            val image = try {
+                r.acquireLatestImage()
+            } catch (_: Exception) {
+                null
+            } ?: return@setOnImageAvailableListener
+
+            var bitmap: Bitmap? = null
+
+            try {
+                val plane = image.planes[0]
+                val pixelStride = plane.pixelStride
+                val rowPadding = plane.rowStride - pixelStride * recWidth
+
+                val full = Bitmap.createBitmap(
+                    recWidth + rowPadding / pixelStride,
+                    recHeight,
+                    Bitmap.Config.ARGB_8888
+                )
+
+                full.copyPixelsFromBuffer(plane.buffer)
+
+                bitmap = Bitmap.createBitmap(full, 0, 0, recWidth, recHeight)
+                if (bitmap !== full) full.recycle()
+            } catch (e: Exception) {
+                e.printStackTrace()
+            } finally {
+                image.close()
+            }
+
+            finish(bitmap, if (bitmap == null) "Screenshot failed" else null)
+        }, mainHandler)
+
+        try {
+            display.setSurface(reader.surface)
+        } catch (e: Exception) {
+            e.printStackTrace()
+            finish(null, "Screenshot failed")
+            return
+        }
+
+        mainHandler.postDelayed({
+            finish(null, "Screenshot failed, try again")
+        }, 1500)
+    }
+
+    private fun endScreenshot(bitmap: Bitmap?, error: String?) {
+        shotInProgress = false
+        ball?.showAgain()
+        draw?.setToolbarVisible(true)
+
+        if (bitmap != null) {
+            saveScreenshot(bitmap)
+        } else if (error != null) {
+            toast(error)
+        }
+    }
+
+    private fun saveScreenshot(bitmap: Bitmap) {
+        Thread {
+            var ok = false
+
+            try {
+                val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US)
+                    .format(Date())
+
+                val values = ContentValues().apply {
+                    put(MediaStore.Images.Media.DISPLAY_NAME, "ScreenPro_$stamp.jpg")
+                    put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                        put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/ScreenPro")
+                        put(MediaStore.Images.Media.IS_PENDING, 1)
+                    }
+                }
+
+                val uri = contentResolver.insert(
+                    MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                    values
+                )
+
+                if (uri != null) {
+                    contentResolver.openOutputStream(uri)?.use {
+                        bitmap.compress(Bitmap.CompressFormat.JPEG, 95, it)
+                    }
+
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                        val done = ContentValues().apply {
+                            put(MediaStore.Images.Media.IS_PENDING, 0)
+                        }
+
+                        contentResolver.update(uri, done, null, null)
+                    }
+
+                    ok = true
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+
+            bitmap.recycle()
+
+            toast(
+                if (ok) "Screenshot saved to Pictures/ScreenPro"
+                else "Couldn't save screenshot"
+            )
+        }.start()
+    }
+
+    // COUNTDOWN
 
     private fun runCountdown(seconds: Int, onDone: () -> Unit) {
         val tv = TextView(this).apply {
             text = seconds.toString()
             textSize = 84f
-            typeface = android.graphics.Typeface.DEFAULT_BOLD
+            typeface = Typeface.DEFAULT_BOLD
             gravity = Gravity.CENTER
             setTextColor(Color.WHITE)
             background = GradientDrawable().apply {
@@ -513,6 +751,7 @@ class RecordingService : Service() {
         }
 
         val size = dp(150)
+
         val params = WindowManager.LayoutParams(
             size,
             size,
@@ -580,6 +819,8 @@ class RecordingService : Service() {
         isCountingDown = false
     }
 
+    // SHAKE TO STOP
+
     private fun startShakeDetection() {
         val enabled = getSharedPreferences("screenpro", MODE_PRIVATE)
             .getBoolean("shake_to_stop", false)
@@ -611,10 +852,7 @@ class RecordingService : Service() {
 
                 if (shakeCount >= 4 && isRecording && !isStopping) {
                     shakeCount = 0
-                    mainHandler.post {
-                        finishRecording()
-                        stopSelf()
-                    }
+                    mainHandler.post { finishRecording() }
                 }
             }
 
@@ -632,429 +870,7 @@ class RecordingService : Service() {
         sensorManager = null
     }
 
-    private fun scheduleAutoCollapse() {
-        mainHandler.removeCallbacks(collapseRunnable)
-        mainHandler.postDelayed(collapseRunnable, 3000)
-    }
-
-    private fun applyDotState() {
-        val dot = dotView ?: return
-
-        dotAnimator?.cancel()
-        dotAnimator = null
-        dot.alpha = 1f
-
-        if (isPaused) {
-            dot.setTextColor(0xFF8A94A6.toInt())
-        } else {
-            dot.setTextColor(0xFFFF4D5A.toInt())
-
-            dotAnimator = ObjectAnimator.ofFloat(dot, "alpha", 1f, 0.25f).apply {
-                duration = 700
-                repeatMode = ValueAnimator.REVERSE
-                repeatCount = ValueAnimator.INFINITE
-                start()
-            }
-        }
-    }
-
-    private fun updateNotification() {
-        try {
-            getSystemService(NotificationManager::class.java)
-                .notify(NOTIFICATION_ID, buildNotification())
-        } catch (_: Exception) {
-        }
-    }
-
-    // FLOATING WIDGET
-
-    private fun showFloatingWidget() {
-        if (!isRecording || floatingWidget != null) return
-
-        if (
-            Build.VERSION.SDK_INT >= Build.VERSION_CODES.M &&
-            !android.provider.Settings.canDrawOverlays(this)
-        ) {
-            Toast.makeText(
-                this,
-                "Allow ScreenPro to display over other apps for floating controls.",
-                Toast.LENGTH_LONG
-            ).show()
-            return
-        }
-
-        try {
-            val panel = LinearLayout(this).apply {
-                orientation = LinearLayout.VERTICAL
-                gravity = Gravity.CENTER
-                setPadding(dp(8), dp(10), dp(8), dp(10))
-                background = rounded(0xEE172033.toInt(), 18)
-                elevation = dp(8).toFloat()
-            }
-
-            val type =
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
-                } else {
-                    @Suppress("DEPRECATION")
-                    WindowManager.LayoutParams.TYPE_PHONE
-                }
-
-            val params = WindowManager.LayoutParams(
-                WindowManager.LayoutParams.WRAP_CONTENT,
-                WindowManager.LayoutParams.WRAP_CONTENT,
-                type,
-                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
-                PixelFormat.TRANSLUCENT
-            ).apply {
-                gravity = Gravity.END or Gravity.CENTER_VERTICAL
-                x = dp(12)
-                y = 0
-            }
-
-            floatingWidget = panel
-            widgetParams = params
-            widgetCollapsed = false
-
-            buildExpandedWidget(panel)
-            windowManager?.addView(panel, params)
-
-            mainHandler.removeCallbacks(tickRunnable)
-            mainHandler.post(tickRunnable)
-
-        } catch (e: Exception) {
-            e.printStackTrace()
-            floatingWidget = null
-            widgetParams = null
-        }
-    }
-
-    private fun buildExpandedWidget(panel: LinearLayout) {
-        panel.removeAllViews()
-        panel.orientation = LinearLayout.VERTICAL
-        panel.gravity = Gravity.CENTER
-        panel.setPadding(dp(8), dp(10), dp(8), dp(10))
-        panel.background = rounded(0xEE172033.toInt(), 18)
-
-        val header = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-        }
-
-        val dragHandle = TextView(this).apply {
-            text = "⋮⋮"
-            textSize = 17f
-            gravity = Gravity.CENTER
-            setTextColor(Color.WHITE)
-            setPadding(dp(5), dp(2), dp(5), dp(8))
-        }
-
-        header.addView(
-            dragHandle,
-            LinearLayout.LayoutParams(0, -2, 1f)
-        )
-
-        val collapseButton = TextView(this).apply {
-            text = "—"
-            textSize = 22f
-            gravity = Gravity.CENTER
-            setTextColor(Color.WHITE)
-            setPadding(dp(8), 0, dp(8), dp(8))
-            setOnClickListener {
-                collapseWidget()
-            }
-        }
-
-        header.addView(collapseButton)
-        panel.addView(header)
-
-        val timerRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER
-            setPadding(0, 0, 0, dp(8))
-        }
-
-        val dot = TextView(this).apply {
-            text = "●"
-            textSize = 11f
-            setTextColor(0xFFFF4D5A.toInt())
-            setPadding(0, 0, dp(5), 0)
-        }
-
-        val timeView = TextView(this).apply {
-            text = formatElapsed(elapsedMs())
-            textSize = 13f
-            typeface = android.graphics.Typeface.DEFAULT_BOLD
-            setTextColor(Color.WHITE)
-        }
-
-        timerRow.addView(dot)
-        timerRow.addView(timeView)
-        panel.addView(timerRow)
-
-        dotView = dot
-        timerText = timeView
-
-        pauseButton = Button(this).apply {
-            text = if (isPaused) "▶" else "Ⅱ"
-            textSize = 19f
-            isAllCaps = false
-            setTextColor(Color.WHITE)
-            background = rounded(0xFF344158.toInt(), 12)
-            setOnClickListener {
-                togglePause()
-            }
-        }
-
-        panel.addView(
-            pauseButton,
-            LinearLayout.LayoutParams(dp(54), dp(48)).apply {
-                bottomMargin = dp(7)
-            }
-        )
-
-        val stopButton = Button(this).apply {
-            text = "■"
-            textSize = 19f
-            isAllCaps = false
-            setTextColor(Color.WHITE)
-            background = rounded(0xFFE52F45.toInt(), 12)
-            setOnClickListener {
-                finishRecording()
-                stopSelf()
-            }
-        }
-
-        panel.addView(
-            stopButton,
-            LinearLayout.LayoutParams(dp(54), dp(48))
-        )
-
-        val params = widgetParams
-        if (params != null) {
-            dragHandle.setOnTouchListener(
-                createDragListener(panel, params)
-            )
-        }
-
-        widgetCollapsed = false
-        updateWidgetLayout()
-        applyDotState()
-        scheduleAutoCollapse()
-    }
-
-    private fun collapseWidget() {
-        val panel = floatingWidget ?: return
-        val params = widgetParams ?: return
-
-        mainHandler.removeCallbacks(collapseRunnable)
-        timerText = null
-
-        panel.removeAllViews()
-        panel.orientation = LinearLayout.HORIZONTAL
-        panel.gravity = Gravity.CENTER
-        panel.setPadding(0, 0, 0, 0)
-        panel.background = rounded(0xEE172033.toInt(), 18)
-
-        val tab = TextView(this).apply {
-            text = "●"
-            textSize = 22f
-            gravity = Gravity.CENTER
-            setTextColor(0xFFFF4D5A.toInt())
-            background = rounded(0xEE172033.toInt(), 18)
-            setPadding(dp(12), dp(12), dp(12), dp(12))
-        }
-
-        tab.setOnTouchListener { view, event ->
-            when (event.action) {
-                MotionEvent.ACTION_DOWN -> {
-                    initialTouchX = event.rawX
-                    initialTouchY = event.rawY
-                    initialWidgetX = params.x
-                    initialWidgetY = params.y
-                    view.tag = false
-                    true
-                }
-
-                MotionEvent.ACTION_MOVE -> {
-                    val deltaX = event.rawX - initialTouchX
-                    val deltaY = event.rawY - initialTouchY
-
-                    if (
-                        kotlin.math.abs(deltaX) > dp(5) ||
-                        kotlin.math.abs(deltaY) > dp(5)
-                    ) {
-                        view.tag = true
-                    }
-
-                    params.x = initialWidgetX - deltaX.toInt()
-                    params.y = initialWidgetY + deltaY.toInt()
-
-                    try {
-                        windowManager?.updateViewLayout(panel, params)
-                    } catch (_: Exception) {
-                    }
-
-                    true
-                }
-
-                MotionEvent.ACTION_UP -> {
-                    val wasDragged = view.tag as? Boolean ?: false
-
-                    if (!wasDragged) {
-                        expandWidget()
-                    }
-
-                    true
-                }
-
-                MotionEvent.ACTION_CANCEL -> true
-                else -> false
-            }
-        }
-
-        panel.addView(
-            tab,
-            LinearLayout.LayoutParams(dp(52), dp(52))
-        )
-
-        widgetCollapsed = true
-        updateWidgetLayout()
-
-        dotView = tab
-        applyDotState()
-    }
-
-    private fun expandWidget() {
-        val panel = floatingWidget ?: return
-        buildExpandedWidget(panel)
-    }
-
-    private fun createDragListener(
-        panel: LinearLayout,
-        params: WindowManager.LayoutParams
-    ): View.OnTouchListener {
-        return View.OnTouchListener { _, event ->
-            when (event.action) {
-                MotionEvent.ACTION_DOWN -> {
-                    scheduleAutoCollapse()
-                    initialTouchX = event.rawX
-                    initialTouchY = event.rawY
-                    initialWidgetX = params.x
-                    initialWidgetY = params.y
-                    true
-                }
-
-                MotionEvent.ACTION_MOVE -> {
-                    scheduleAutoCollapse()
-
-                    params.x = initialWidgetX -
-                        (event.rawX - initialTouchX).toInt()
-
-                    params.y = initialWidgetY +
-                        (event.rawY - initialTouchY).toInt()
-
-                    try {
-                        windowManager?.updateViewLayout(panel, params)
-                    } catch (_: Exception) {
-                    }
-
-                    true
-                }
-
-                else -> false
-            }
-        }
-    }
-
-    private fun updateWidgetLayout() {
-        val panel = floatingWidget ?: return
-        val params = widgetParams ?: return
-
-        try {
-            windowManager?.updateViewLayout(panel, params)
-        } catch (_: Exception) {
-        }
-    }
-
-    private fun togglePause() {
-        val recorder = mediaRecorder ?: return
-
-        if (!isRecording || isStopping) return
-
-        try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                if (isPaused) {
-                    recorder.resume()
-                    isPaused = false
-                    pausedTotal += SystemClock.elapsedRealtime() - pausedAt
-                    isPausedNow = false
-                    pauseButton?.text = "Ⅱ"
-
-                    Toast.makeText(
-                        this,
-                        "Recording resumed",
-                        Toast.LENGTH_SHORT
-                    ).show()
-                } else {
-                    recorder.pause()
-                    isPaused = true
-                    pausedAt = SystemClock.elapsedRealtime()
-                    isPausedNow = true
-                    pauseButton?.text = "▶"
-
-                    Toast.makeText(
-                        this,
-                        "Recording paused",
-                        Toast.LENGTH_SHORT
-                    ).show()
-                }
-
-                applyDotState()
-                updateNotification()
-                scheduleAutoCollapse()
-                sendRecordingState(true)
-            } else {
-                Toast.makeText(
-                    this,
-                    "Pause is not supported on this Android version.",
-                    Toast.LENGTH_LONG
-                ).show()
-            }
-        } catch (e: Exception) {
-            e.printStackTrace()
-
-            Toast.makeText(
-                this,
-                "Unable to change recording state.",
-                Toast.LENGTH_LONG
-            ).show()
-        }
-    }
-
-    private fun removeFloatingWidget() {
-        val widget = floatingWidget ?: return
-
-        try {
-            windowManager?.removeView(widget)
-        } catch (_: Exception) {
-        }
-
-        mainHandler.removeCallbacks(collapseRunnable)
-        mainHandler.removeCallbacks(tickRunnable)
-        dotAnimator?.cancel()
-        dotAnimator = null
-        dotView = null
-        timerText = null
-
-        floatingWidget = null
-        pauseButton = null
-        widgetParams = null
-        widgetCollapsed = false
-    }
-
-    // STOP AND SAVE RECORDING
+    // FINISH
 
     private fun finishRecording() {
         if (isStopping) return
@@ -1063,16 +879,20 @@ class RecordingService : Service() {
 
         cancelCountdown()
         stopShakeDetection()
-        mainHandler.removeCallbacks(collapseRunnable)
         mainHandler.removeCallbacks(tickRunnable)
 
+        draw?.hide()
+        draw = null
+        ball?.remove()
+        ball = null
+
         val wasRecording = isRecording
-        var successfullySaved = false
+        var recordedOk = false
 
         if (wasRecording) {
             try {
                 mediaRecorder?.stop()
-                successfullySaved = true
+                recordedOk = true
             } catch (e: Exception) {
                 e.printStackTrace()
             }
@@ -1082,6 +902,17 @@ class RecordingService : Service() {
         isPaused = false
         isActive = false
         isPausedNow = false
+
+        val audio = audioCapture
+        val audioPath = audioFile
+        audioCapture = null
+        audioFile = null
+
+        try {
+            audio?.stop()
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
 
         try {
             mediaRecorder?.reset()
@@ -1094,6 +925,7 @@ class RecordingService : Service() {
         }
 
         mediaRecorder = null
+        recorderSurface = null
 
         try {
             virtualDisplay?.release()
@@ -1116,35 +948,129 @@ class RecordingService : Service() {
         }
 
         try {
-            outputDescriptor?.close()
+            tmpDescriptor?.close()
         } catch (_: Exception) {
         }
 
-        outputDescriptor = null
+        tmpDescriptor = null
 
-        outputUri?.let { uri ->
-            try {
-                if (successfullySaved) {
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                        val values = ContentValues().apply {
-                            put(MediaStore.Video.Media.IS_PENDING, 0)
-                        }
+        val uri = tmpUri
+        val name = finalName
+        tmpUri = null
 
-                        contentResolver.update(uri, values, null, null)
-                    }
-                } else {
-                    contentResolver.delete(uri, null, null)
-                }
-            } catch (e: Exception) {
-                e.printStackTrace()
+        sendRecordingState(false)
+        updateNotification()
+
+        Thread {
+            val saved = finalizeOutput(uri, name, recordedOk, audio, audioPath)
+
+            mainHandler.post {
+                sendSaved(saved)
+                removeForegroundNotification()
+                stopSelf()
             }
+        }.start()
+    }
+
+    private fun finalizeOutput(
+        uri: Uri?,
+        name: String,
+        recordedOk: Boolean,
+        audio: AudioCapture?,
+        audioPath: File?
+    ): Boolean {
+        var saved = false
+
+        try {
+            if (uri == null) return false
+
+            if (!recordedOk) {
+                try {
+                    contentResolver.delete(uri, null, null)
+                } catch (_: Exception) {
+                }
+
+                return false
+            }
+
+            val audioReady = audio != null &&
+                audio.usable &&
+                audioPath != null &&
+                audioPath.exists()
+
+            if (audioReady) {
+                var muxedUri: Uri? = null
+
+                try {
+                    muxedUri = insertVideoEntry(name)
+
+                    val outPfd = contentResolver.openFileDescriptor(muxedUri, "rw")
+                        ?: throw IllegalStateException("Could not open output")
+
+                    val inPfd = contentResolver.openFileDescriptor(uri, "r")
+                        ?: throw IllegalStateException("Could not open recording")
+
+                    try {
+                        AvMuxer.mux(
+                            inPfd.fileDescriptor,
+                            audioPath!!.absolutePath,
+                            outPfd.fileDescriptor
+                        )
+                    } finally {
+                        inPfd.close()
+                        outPfd.close()
+                    }
+
+                    publish(muxedUri, null)
+
+                    try {
+                        contentResolver.delete(uri, null, null)
+                    } catch (_: Exception) {
+                    }
+
+                    saved = true
+                } catch (e: Exception) {
+                    e.printStackTrace()
+
+                    muxedUri?.let {
+                        try {
+                            contentResolver.delete(it, null, null)
+                        } catch (_: Exception) {
+                        }
+                    }
+
+                    // Keep the video even if adding audio failed.
+                    publish(uri, name)
+                    saved = true
+                    toast("Couldn't add audio to the video, saved without sound.")
+                }
+            } else {
+                publish(uri, name)
+                saved = true
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        } finally {
+            audioPath?.delete()
         }
 
-        outputUri = null
+        return saved
+    }
 
-        removeFloatingWidget()
-        sendRecordingState(false)
-        removeForegroundNotification()
+    private fun publish(uri: Uri, renameTo: String?) {
+        val values = ContentValues()
+
+        if (renameTo != null) {
+            values.put(MediaStore.Video.Media.DISPLAY_NAME, renameTo)
+        }
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            values.put(MediaStore.Video.Media.IS_PENDING, 0)
+        }
+
+        if (values.size() > 0) {
+            contentResolver.update(uri, values, null, null)
+        }
     }
 
     private fun removeForegroundNotification() {
@@ -1164,7 +1090,17 @@ class RecordingService : Service() {
         foregroundStarted = false
     }
 
-    // NOTIFICATION WITH PAUSE / STOP ACTIONS
+    // NOTIFICATION
+
+    private fun updateNotification() {
+        if (!foregroundStarted) return
+
+        try {
+            getSystemService(NotificationManager::class.java)
+                .notify(NOTIFICATION_ID, buildNotification())
+        } catch (_: Exception) {
+        }
+    }
 
     private fun buildNotification(): Notification {
         val flags = PendingIntent.FLAG_UPDATE_CURRENT or
@@ -1204,6 +1140,7 @@ class RecordingService : Service() {
             .setContentTitle("ScreenPro Recorder")
             .setContentText(
                 when {
+                    isStopping -> "Saving recording…"
                     isPaused -> "Recording paused"
                     isRecording -> "Your screen is being recorded"
                     else -> "Starting…"
@@ -1213,7 +1150,7 @@ class RecordingService : Service() {
             .setOngoing(true)
             .setContentIntent(openIntent)
 
-        if (isRecording) {
+        if (isRecording && !isStopping) {
             builder
                 .setWhen(System.currentTimeMillis() - elapsedMs())
                 .setShowWhen(true)
@@ -1228,12 +1165,14 @@ class RecordingService : Service() {
             )
         }
 
-        @Suppress("DEPRECATION")
-        builder.addAction(
-            android.R.drawable.ic_menu_close_clear_cancel,
-            "Stop",
-            stopIntent
-        )
+        if (!isStopping) {
+            @Suppress("DEPRECATION")
+            builder.addAction(
+                android.R.drawable.ic_menu_close_clear_cancel,
+                "Stop",
+                stopIntent
+            )
+        }
 
         return builder.build()
     }
@@ -1248,32 +1187,24 @@ class RecordingService : Service() {
                 description = "Screen recording status"
             }
 
-            val manager =
-                getSystemService(NotificationManager::class.java)
-
-            manager.createNotificationChannel(channel)
+            getSystemService(NotificationManager::class.java)
+                .createNotificationChannel(channel)
         }
     }
 
-    private fun rounded(
-        color: Int,
-        radius: Int
-    ): GradientDrawable {
-        return GradientDrawable().apply {
-            setColor(color)
-            cornerRadius = dp(radius).toFloat()
+    // HELPERS
+
+    private fun toast(message: String) {
+        mainHandler.post {
+            Toast.makeText(applicationContext, message, Toast.LENGTH_LONG).show()
         }
     }
 
-    private fun dp(value: Int): Int {
-        return (
-            value * resources.displayMetrics.density
-        ).toInt()
-    }
+    private fun dp(value: Int): Int =
+        (value * resources.displayMetrics.density).toInt()
 
     override fun onDestroy() {
         finishRecording()
-        removeFloatingWidget()
         super.onDestroy()
     }
 

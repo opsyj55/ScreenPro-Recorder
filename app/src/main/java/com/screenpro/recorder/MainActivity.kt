@@ -1,6 +1,9 @@
 package com.screenpro.recorder
 
 import android.Manifest
+import android.animation.ObjectAnimator
+import android.animation.PropertyValuesHolder
+import android.animation.ValueAnimator
 import android.app.Activity
 import android.app.AlertDialog
 import android.content.BroadcastReceiver
@@ -8,76 +11,139 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.content.res.ColorStateList
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.media.projection.MediaProjectionManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.os.SystemClock
+import android.provider.MediaStore
+import android.provider.Settings
+import android.util.Size
 import android.view.Gravity
 import android.view.View
-import android.widget.Button
+import android.view.ViewOutlineProvider
+import android.widget.FrameLayout
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.Switch
 import android.widget.TextView
 import android.widget.Toast
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import java.util.concurrent.Executors
 
 class MainActivity : Activity() {
 
-    private lateinit var projectionManager: MediaProjectionManager
-    private lateinit var status: TextView
-    private lateinit var timer: TextView
-    private lateinit var startButton: Button
-    private lateinit var stopButton: Button
-    private lateinit var recordingsCount: TextView
-    private lateinit var readyBadge: TextView
-
-    private var pendingStart = false
-    private var recording = false
-    private var recordingPaused = false
-    private var receiverRegistered = false
-    private var stopRequested = false
-
-    private val uiHandler = Handler(Looper.getMainLooper())
-
-    // Timer is driven by the service's own clock, so it stays correct
-    // even if the app is closed and reopened during a recording.
-    private val tick = object : Runnable {
-        override fun run() {
-            if (recording && !recordingPaused) {
-                timer.text = RecordingService.formatElapsed(
-                    RecordingService.elapsedMs()
-                )
-                uiHandler.postDelayed(this, 300)
-            }
-        }
-    }
-
     companion object {
         const val EXTRA_AUTO_START = "screenpro_auto_start"
+
+        private const val REQ_CAPTURE = 1001
+        private const val REQ_AUDIO = 1002
+        private const val REQ_NOTIFICATIONS = 1003
+        private const val REQ_DELETE = 2001
+    }
+
+    // PALETTE
+    private val cBg = Color.parseColor("#0E1320")
+    private val cBar = Color.parseColor("#121A2B")
+    private val cCard = Color.parseColor("#182034")
+    private val cCard2 = Color.parseColor("#212B45")
+    private val cText = Color.parseColor("#F2F5FA")
+    private val cMuted = Color.parseColor("#8C97AD")
+    private val cAccent = Color.parseColor("#FF4D5A")
+    private val cOrange = Color.parseColor("#FF8A00")
+
+    private lateinit var projectionManager: MediaProjectionManager
+    private val ui = Handler(Looper.getMainLooper())
+    private val io = Executors.newSingleThreadExecutor()
+
+    private val prefs get() = getSharedPreferences("screenpro", MODE_PRIVATE)
+
+    private var recording = false
+    private var paused = false
+    private var saving = false
+    private var pendingStart = false
+    private var receiverRegistered = false
+    private var currentTab = 0
+    private var pendingDelete: Uri? = null
+
+    // Views
+    private lateinit var pages: List<View>
+    private lateinit var tabViews: List<TextView>
+    private lateinit var statusChip: TextView
+    private lateinit var timerView: TextView
+    private lateinit var subtitleView: TextView
+    private lateinit var hintView: TextView
+    private lateinit var recordRing: View
+    private lateinit var recordInner: View
+    private lateinit var pauseButton: TextView
+    private lateinit var chipsHolder: LinearLayout
+    private lateinit var warnCard: LinearLayout
+    private lateinit var libraryHolder: LinearLayout
+    private lateinit var libraryCount: TextView
+    private lateinit var settingsHolder: LinearLayout
+
+    private var pulse: ObjectAnimator? = null
+
+    private val tick = object : Runnable {
+        override fun run() {
+            if (recording && !paused) {
+                timerView.text = RecordingService.formatElapsed(
+                    RecordingService.elapsedMs()
+                )
+                ui.postDelayed(this, 300)
+            }
+        }
     }
 
     private val receiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
-            if (intent?.action == RecordingService.ACTION_STATE_CHANGED) {
-                val isActive = intent.getBooleanExtra(
-                    RecordingService.EXTRA_IS_RECORDING,
-                    false
-                )
+            when (intent?.action) {
+                RecordingService.ACTION_STATE_CHANGED -> {
+                    val was = recording
 
-                val isPaused = intent.getBooleanExtra(
-                    RecordingService.EXTRA_IS_PAUSED,
-                    false
-                )
+                    recording = intent.getBooleanExtra(
+                        RecordingService.EXTRA_IS_RECORDING,
+                        false
+                    )
 
-                setRecording(isActive, isPaused)
+                    paused = recording && intent.getBooleanExtra(
+                        RecordingService.EXTRA_IS_PAUSED,
+                        false
+                    )
+
+                    if (was && !recording) {
+                        saving = true
+                        ui.postDelayed({
+                            saving = false
+                            render()
+                        }, 30000)
+                    }
+
+                    render()
+                }
+
+                RecordingService.ACTION_SAVED -> {
+                    saving = false
+                    render()
+                    refreshLibrary()
+
+                    if (intent.getBooleanExtra(RecordingService.EXTRA_SAVED, false)) {
+                        toast("Saved to Movies/ScreenPro")
+                    }
+                }
             }
         }
     }
+
+    // LIFECYCLE
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -85,9 +151,12 @@ class MainActivity : Activity() {
         projectionManager =
             getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
 
-        createUi()
-        setRecording(false, false)
-        updateRecordingCount()
+        window.statusBarColor = cBg
+        window.navigationBarColor = cBar
+
+        buildUi()
+        showTab(0)
+        render()
         handleLaunchIntent(intent)
     }
 
@@ -97,11 +166,10 @@ class MainActivity : Activity() {
         handleLaunchIntent(intent)
     }
 
-    // Started from the Quick Settings tile.
     private fun handleLaunchIntent(launch: Intent?) {
         if (launch?.getBooleanExtra(EXTRA_AUTO_START, false) == true) {
             launch.removeExtra(EXTRA_AUTO_START)
-            uiHandler.post { requestPermissionsAndCapture() }
+            ui.post { requestPermissionsAndCapture() }
         }
     }
 
@@ -109,27 +177,25 @@ class MainActivity : Activity() {
         super.onResume()
 
         if (!receiverRegistered) {
-            val filter = IntentFilter(
-                RecordingService.ACTION_STATE_CHANGED
-            )
+            val filter = IntentFilter().apply {
+                addAction(RecordingService.ACTION_STATE_CHANGED)
+                addAction(RecordingService.ACTION_SAVED)
+            }
 
             if (Build.VERSION.SDK_INT >= 33) {
-                registerReceiver(
-                    receiver,
-                    filter,
-                    RECEIVER_NOT_EXPORTED
-                )
+                registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
             } else {
-                @Suppress("DEPRECATION")
                 registerReceiver(receiver, filter)
             }
 
             receiverRegistered = true
         }
 
-        // Re-sync with the service in case a recording is already running.
-        setRecording(RecordingService.isActive, RecordingService.isPausedNow)
-        updateRecordingCount()
+        recording = RecordingService.isActive
+        paused = RecordingService.isPausedNow
+
+        refreshAll()
+        refreshLibrary()
     }
 
     override fun onPause() {
@@ -142,544 +208,699 @@ class MainActivity : Activity() {
             receiverRegistered = false
         }
 
+        ui.removeCallbacks(tick)
         super.onPause()
     }
 
-    private fun createUi() {
+    override fun onDestroy() {
+        pulse?.cancel()
+        io.shutdown()
+        super.onDestroy()
+    }
+
+    // UI SHELL
+
+    private fun buildUi() {
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(0xFFF4F6FA.toInt())
+            setBackgroundColor(cBg)
+
+            setOnApplyWindowInsetsListener { v, insets ->
+                @Suppress("DEPRECATION")
+                v.setPadding(
+                    insets.systemWindowInsetLeft,
+                    insets.systemWindowInsetTop,
+                    insets.systemWindowInsetRight,
+                    insets.systemWindowInsetBottom
+                )
+                insets
+            }
         }
 
-        val scroll = ScrollView(this)
-
-        val page = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(
-                dp(20),
-                dp(34),
-                dp(20),
-                dp(28)
-            )
-        }
-
-        scroll.addView(page)
-
-        // TOP BAR
-
+        // Header
         val header = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(20), dp(16), dp(20), dp(6))
         }
 
-        val logo = label(
-            "▶",
-            21,
-            Color.WHITE,
-            true
-        ).apply {
-            gravity = Gravity.CENTER
-            background = rounded(0xFFE52F45.toInt(), 14)
-            elevation = dp(2).toFloat()
-
-            layoutParams = LinearLayout.LayoutParams(
-                dp(44),
-                dp(44)
-            )
-        }
-
-        header.addView(logo)
-
-        val brand = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(11), 0, 0, 0)
-        }
-
-        brand.addView(
-            label(
-                "ScreenPro",
-                22,
-                0xFF172033.toInt(),
-                true
-            )
-        )
-
-        brand.addView(
-            label(
-                "SCREEN RECORDER",
-                10,
-                0xFF7A8497.toInt(),
-                true
-            )
+        header.addView(
+            label("Screen", 24, cText, true),
+            LinearLayout.LayoutParams(-2, -2)
         )
 
         header.addView(
-            brand,
-            LinearLayout.LayoutParams(0, -2, 1f)
+            label("Pro", 24, cAccent, true),
+            LinearLayout.LayoutParams(-2, -2)
         )
 
-        val menuButton = TextView(this).apply {
-            text = "☰"
-            textSize = 22f
-            gravity = Gravity.CENTER
-            setTextColor(0xFF172033.toInt())
-            background = rounded(Color.WHITE, 14)
-            elevation = dp(2).toFloat()
+        root.addView(header)
 
-            layoutParams = LinearLayout.LayoutParams(
-                dp(44),
-                dp(44)
-            )
+        // Pages
+        val holder = FrameLayout(this)
 
-            setOnClickListener {
-                showAppMenu()
-            }
-        }
+        val recordPage = buildRecordPage()
+        val libraryPage = buildLibraryPage()
+        val settingsPage = buildSettingsPage()
 
-        header.addView(menuButton)
-        page.addView(header)
+        pages = listOf(recordPage, libraryPage, settingsPage)
+        pages.forEach { holder.addView(it) }
 
-        // GREETING
+        root.addView(holder, LinearLayout.LayoutParams(-1, 0, 1f))
 
-        val intro = label(
-            "Your screen. Your story.",
-            27,
-            0xFF172033.toInt(),
-            true
-        )
-
-        intro.setPadding(0, dp(28), 0, dp(6))
-        page.addView(intro)
-
-        page.addView(
-            label(
-                "Capture tutorials, gameplay, meetings and moments.",
-                14,
-                0xFF758095.toInt(),
-                false
-            )
-        )
-
-        // RECORDING STATUS CARD
-
-        val statusCard = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(
-                dp(20),
-                dp(20),
-                dp(20),
-                dp(20)
-            )
-            background = rounded(0xFF172033.toInt(), 24)
-            elevation = dp(4).toFloat()
-        }
-
-        val statusHeader = LinearLayout(this).apply {
+        // Bottom tabs
+        val bar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
+            setBackgroundColor(cBar)
+            setPadding(0, dp(8), 0, dp(8))
         }
 
-        statusHeader.addView(
-            label(
-                "●  RECORDING STUDIO",
-                12,
-                0xFFBFC8D8.toInt(),
-                true
-            ),
-            LinearLayout.LayoutParams(0, -2, 1f)
-        )
+        val titles = listOf("🎬\nRecord", "🎞\nLibrary", "⚙\nSettings")
 
-        readyBadge = label(
-            "READY",
-            10,
-            0xFF198754.toInt(),
-            true
-        ).apply {
-            gravity = Gravity.CENTER
-            setPadding(
-                dp(12),
-                dp(7),
-                dp(12),
-                dp(7)
-            )
-            background = rounded(0xFFE3F5EB.toInt(), 30)
-        }
-
-        statusHeader.addView(readyBadge)
-        statusCard.addView(statusHeader)
-
-        timer = TextView(this).apply {
-            text = "00:00"
-            textSize = 43f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(Color.WHITE)
-            gravity = Gravity.CENTER
-            setPadding(0, dp(24), 0, dp(4))
-        }
-
-        statusCard.addView(timer)
-
-        status = label(
-            "Ready when you are",
-            13,
-            0xFFBFC8D8.toInt(),
-            false
-        ).apply {
-            gravity = Gravity.CENTER
-            setPadding(0, dp(4), 0, dp(22))
-        }
-
-        statusCard.addView(status)
-
-        // START BUTTON
-
-        startButton = Button(this).apply {
-            text = "●   START RECORDING"
-            textSize = 15f
-            isAllCaps = false
-            setTextColor(Color.WHITE)
-            background = rounded(0xFFE52F45.toInt(), 16)
-
-            setOnClickListener {
-                requestPermissionsAndCapture()
-            }
-        }
-
-        statusCard.addView(
-            startButton,
-            LinearLayout.LayoutParams(-1, dp(58))
-        )
-
-        // STOP BUTTON
-
-        stopButton = Button(this).apply {
-            text = "■   STOP RECORDING"
-            textSize = 15f
-            isAllCaps = false
-            setTextColor(Color.WHITE)
-            background = rounded(0xFF344158.toInt(), 16)
-            visibility = View.GONE
-
-            setOnClickListener {
-                if (stopRequested) return@setOnClickListener
-
-                stopRequested = true
-                isEnabled = false
-                status.text = "Stopping recording…"
-                readyBadge.text = "SAVING"
-
-                val stopIntent = Intent(
-                    this@MainActivity,
-                    RecordingService::class.java
-                ).apply {
-                    action = RecordingService.ACTION_STOP
-                }
-
-                try {
-                    startService(stopIntent)
-
-                    Toast.makeText(
-                        this@MainActivity,
-                        "Stopping recording…",
-                        Toast.LENGTH_SHORT
-                    ).show()
-                } catch (e: Exception) {
-                    stopRequested = false
-                    isEnabled = true
-                    status.text = "Could not stop recording. Please try again."
-                    readyBadge.text = "RECORDING"
-
-                    Toast.makeText(
-                        this@MainActivity,
-                        "Unable to send stop command.",
-                        Toast.LENGTH_LONG
-                    ).show()
-                }
-            }
-        }
-
-        statusCard.addView(
-            stopButton,
-            LinearLayout.LayoutParams(-1, dp(58)).apply {
-                topMargin = dp(10)
-            }
-        )
-
-        page.addView(
-            statusCard,
-            LinearLayout.LayoutParams(-1, -2).apply {
-                topMargin = dp(25)
-            }
-        )
-
-        // QUICK FEATURES
-
-        page.addView(
-            label(
-                "Quick features",
-                19,
-                0xFF172033.toInt(),
-                true
-            ).apply {
-                setPadding(0, dp(27), 0, dp(13))
-            }
-        )
-
-        val featureRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-        }
-
-        featureRow.addView(
-            featureCard(
-                "🎙",
-                "Microphone",
-                "Audio capture"
-            ) {
-                showMicrophoneOptions()
-            },
-            LinearLayout.LayoutParams(0, dp(112), 1f).apply {
-                rightMargin = dp(7)
-            }
-        )
-
-        featureRow.addView(
-            featureCard(
-                "▣",
-                "HD Video",
-                "Recording quality"
-            ) {
-                showVideoOptions()
-            },
-            LinearLayout.LayoutParams(0, dp(112), 1f).apply {
-                leftMargin = dp(7)
-            }
-        )
-
-        page.addView(featureRow)
-
-        page.addView(
-            optionsCard(),
-            LinearLayout.LayoutParams(-1, -2).apply {
-                topMargin = dp(14)
-            }
-        )
-
-        // RECORDINGS HEADER
-
-        val libraryHeader = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, dp(28), 0, dp(13))
-        }
-
-        libraryHeader.addView(
-            label(
-                "My recordings",
-                19,
-                0xFF172033.toInt(),
-                true
-            ),
-            LinearLayout.LayoutParams(0, -2, 1f)
-        )
-
-        libraryHeader.addView(
-            label(
-                "VIEW ALL  ›",
-                12,
-                0xFFE52F45.toInt(),
-                true
-            ).apply {
-                setOnClickListener {
-                    showRecordings()
-                }
-            }
-        )
-
-        page.addView(libraryHeader)
-
-        // RECORDINGS CARD
-
-        val libraryCard = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(
-                dp(16),
-                dp(16),
-                dp(16),
-                dp(16)
-            )
-            background = rounded(Color.WHITE, 19)
-            elevation = dp(2).toFloat()
-
-            setOnClickListener {
-                showRecordings()
-            }
-        }
-
-        val libraryIcon = label(
-            "▶",
-            22,
-            0xFFE52F45.toInt(),
-            true
-        ).apply {
-            gravity = Gravity.CENTER
-            background = rounded(0xFFFFEDF0.toInt(), 15)
-
-            layoutParams = LinearLayout.LayoutParams(
-                dp(52),
-                dp(52)
-            )
-        }
-
-        libraryCard.addView(libraryIcon)
-
-        val libraryText = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(13), 0, 0, 0)
-        }
-
-        libraryText.addView(
-            label(
-                "Recorded videos",
-                15,
-                0xFF172033.toInt(),
-                true
-            )
-        )
-
-        recordingsCount = label(
-            "Browse your saved captures",
-            12,
-            0xFF7A8497.toInt(),
-            false
-        )
-
-        libraryText.addView(recordingsCount)
-
-        libraryCard.addView(
-            libraryText,
-            LinearLayout.LayoutParams(0, -2, 1f)
-        )
-
-        libraryCard.addView(
-            label(
-                "›",
-                28,
-                0xFF7A8497.toInt(),
-                false
-            )
-        )
-
-        page.addView(libraryCard)
-
-        page.addView(
-            label(
-                "Your videos are saved on this device.",
-                12,
-                0xFF8A94A6.toInt(),
-                false
-            ).apply {
+        tabViews = titles.mapIndexed { index, title ->
+            TextView(this).apply {
+                text = title
+                textSize = 12f
                 gravity = Gravity.CENTER
-                setPadding(0, dp(22), 0, 0)
+                setPadding(0, dp(4), 0, dp(4))
+                setOnClickListener { showTab(index) }
             }
-        )
+        }
 
-        root.addView(
-            scroll,
-            LinearLayout.LayoutParams(-1, -1)
-        )
+        tabViews.forEach {
+            bar.addView(it, LinearLayout.LayoutParams(0, -2, 1f))
+        }
 
+        root.addView(bar)
         setContentView(root)
     }
 
-    // QUICK FEATURE CARD
+    private fun showTab(index: Int) {
+        currentTab = index
 
-    private fun featureCard(
-        icon: String,
-        title: String,
-        subtitle: String,
-        onTap: () -> Unit
-    ): View {
-        val card = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(
-                dp(15),
-                dp(12),
-                dp(12),
-                dp(12)
-            )
-            background = rounded(Color.WHITE, 18)
-            elevation = dp(2).toFloat()
-            isClickable = true
-            isFocusable = true
-
-            setOnClickListener {
-                onTap()
-            }
+        pages.forEachIndexed { i, page ->
+            page.visibility = if (i == index) View.VISIBLE else View.GONE
         }
 
-        card.addView(
-            label(
-                icon,
-                24,
-                0xFFE52F45.toInt(),
-                true
-            )
-        )
+        tabViews.forEachIndexed { i, tab ->
+            tab.setTextColor(if (i == index) cAccent else cMuted)
+            tab.typeface = if (i == index) Typeface.DEFAULT_BOLD else Typeface.DEFAULT
+        }
 
-        card.addView(
-            label(
-                title,
-                14,
-                0xFF172033.toInt(),
-                true
-            ).apply {
-                setPadding(0, dp(5), 0, dp(2))
-            }
-        )
-
-        card.addView(
-            label(
-                subtitle,
-                11,
-                0xFF7A8497.toInt(),
-                false
-            )
-        )
-
-        return card
+        if (index == 1) refreshLibrary()
     }
 
-    // RECORDING OPTIONS (switches)
+    // RECORD PAGE
 
-    private fun optionsCard(): View {
-        val card = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(16), dp(10), dp(16), dp(10))
-            background = rounded(Color.WHITE, 18)
-            elevation = dp(2).toFloat()
+    private fun buildRecordPage(): View {
+        val scroll = ScrollView(this).apply {
+            overScrollMode = View.OVER_SCROLL_NEVER
+            isFillViewport = true
         }
 
-        card.addView(
-            switchRow(
-                "3-2-1 countdown",
-                "Get ready before recording starts",
-                "countdown_enabled",
-                true
-            )
+        val col = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+            setPadding(dp(20), dp(8), dp(20), dp(24))
+        }
+
+        statusChip = TextView(this).apply {
+            textSize = 12f
+            typeface = Typeface.DEFAULT_BOLD
+            gravity = Gravity.CENTER
+            setPadding(dp(16), dp(6), dp(16), dp(6))
+        }
+
+        col.addView(statusChip, LinearLayout.LayoutParams(-2, -2).apply {
+            topMargin = dp(10)
+        })
+
+        timerView = TextView(this).apply {
+            text = "00:00"
+            textSize = 58f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(cText)
+            gravity = Gravity.CENTER
+            letterSpacing = 0.03f
+        }
+
+        col.addView(timerView, LinearLayout.LayoutParams(-2, -2).apply {
+            topMargin = dp(6)
+        })
+
+        subtitleView = label("", 13, cMuted, false).apply {
+            gravity = Gravity.CENTER
+        }
+
+        col.addView(subtitleView, LinearLayout.LayoutParams(-2, -2))
+
+        // Big record button
+        val buttonRoot = FrameLayout(this).apply {
+            setOnClickListener { onRecordPressed() }
+        }
+
+        recordRing = View(this).apply {
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setStroke(dp(3), cAccent)
+            }
+        }
+
+        buttonRoot.addView(
+            recordRing,
+            FrameLayout.LayoutParams(dp(176), dp(176), Gravity.CENTER)
         )
 
-        card.addView(
-            switchRow(
-                "Shake to stop",
-                "Shake your phone to end the recording",
-                "shake_to_stop",
+        val circle = View(this).apply {
+            background = GradientDrawable(
+                GradientDrawable.Orientation.TL_BR,
+                intArrayOf(cAccent, cOrange)
+            ).apply { shape = GradientDrawable.OVAL }
+            elevation = dp(8).toFloat()
+        }
+
+        buttonRoot.addView(
+            circle,
+            FrameLayout.LayoutParams(dp(140), dp(140), Gravity.CENTER)
+        )
+
+        recordInner = View(this).apply {
+            elevation = dp(10).toFloat()
+        }
+
+        buttonRoot.addView(
+            recordInner,
+            FrameLayout.LayoutParams(dp(46), dp(46), Gravity.CENTER)
+        )
+
+        col.addView(buttonRoot, LinearLayout.LayoutParams(dp(220), dp(220)).apply {
+            topMargin = dp(18)
+        })
+
+        hintView = label("", 13, cMuted, false).apply {
+            gravity = Gravity.CENTER
+        }
+
+        col.addView(hintView, LinearLayout.LayoutParams(-2, -2))
+
+        pauseButton = TextView(this).apply {
+            textSize = 14f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(cText)
+            gravity = Gravity.CENTER
+            setPadding(dp(28), dp(11), dp(28), dp(11))
+            background = rounded(cCard2, 26)
+            setOnClickListener {
+                startService(
+                    Intent(this@MainActivity, RecordingService::class.java).apply {
+                        action = RecordingService.ACTION_TOGGLE_PAUSE
+                    }
+                )
+            }
+        }
+
+        col.addView(pauseButton, LinearLayout.LayoutParams(-2, -2).apply {
+            topMargin = dp(14)
+        })
+
+        // Permission warning
+        warnCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(14), dp(16), dp(14))
+            background = rounded(Color.parseColor("#2A2313"), 16)
+        }
+
+        warnCard.addView(label("Floating controls are off", 14, cOrange, true))
+        warnCard.addView(
+            label(
+                "Allow \"Display over other apps\" to get the floating ball, pen, screenshots and the 3-2-1 countdown.",
+                12,
+                cMuted,
                 false
+            ).apply { setPadding(0, dp(4), 0, dp(10)) }
+        )
+
+        warnCard.addView(
+            TextView(this).apply {
+                text = "Enable"
+                textSize = 13f
+                typeface = Typeface.DEFAULT_BOLD
+                setTextColor(Color.WHITE)
+                gravity = Gravity.CENTER
+                setPadding(dp(20), dp(9), dp(20), dp(9))
+                background = rounded(cOrange, 20)
+                setOnClickListener { openOverlaySettings() }
+            },
+            LinearLayout.LayoutParams(-2, -2)
+        )
+
+        col.addView(warnCard, LinearLayout.LayoutParams(-1, -2).apply {
+            topMargin = dp(20)
+        })
+
+        chipsHolder = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+        }
+
+        col.addView(chipsHolder, LinearLayout.LayoutParams(-1, -2).apply {
+            topMargin = dp(22)
+        })
+
+        scroll.addView(col)
+        return scroll
+    }
+
+    private fun refreshChips() {
+        chipsHolder.removeAllViews()
+
+        val cards = listOf(
+            chipCard("🎙", "Audio", audioShort(), true) { chooseAudioSource() },
+            chipCard("⏱", "Countdown", onOff("countdown_enabled", true), isOn("countdown_enabled", true)) {
+                toggle("countdown_enabled", true)
+            },
+            chipCard("🫧", "Floating ball", onOff("floating_ball", true), isOn("floating_ball", true)) {
+                toggle("floating_ball", true)
+            },
+            chipCard("📳", "Shake to stop", onOff("shake_to_stop", false), isOn("shake_to_stop", false)) {
+                toggle("shake_to_stop", false)
+            }
+        )
+
+        for (i in cards.indices step 2) {
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+            }
+
+            row.addView(
+                cards[i],
+                LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = dp(6) }
+            )
+
+            row.addView(
+                cards[i + 1],
+                LinearLayout.LayoutParams(0, -2, 1f).apply { marginStart = dp(6) }
+            )
+
+            chipsHolder.addView(
+                row,
+                LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(12) }
+            )
+        }
+    }
+
+    private fun chipCard(
+        emoji: String,
+        title: String,
+        state: String,
+        active: Boolean,
+        onClick: () -> Unit
+    ): View {
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(14), dp(16), dp(14))
+
+            background = GradientDrawable().apply {
+                setColor(if (active) cCard2 else cCard)
+                cornerRadius = dp(18).toFloat()
+
+                if (active) setStroke(dp(1), Color.parseColor("#55FF4D5A"))
+            }
+
+            addView(label(emoji, 22, cText, false))
+            addView(label(title, 14, cText, true).apply { setPadding(0, dp(6), 0, 0) })
+            addView(
+                label(state, 12, if (active) cOrange else cMuted, true)
+            )
+
+            setOnClickListener { onClick() }
+        }
+    }
+
+    // LIBRARY PAGE
+
+    private fun buildLibraryPage(): View {
+        val scroll = ScrollView(this).apply {
+            overScrollMode = View.OVER_SCROLL_NEVER
+        }
+
+        val col = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(8), dp(20), dp(24))
+        }
+
+        col.addView(label("Recordings", 20, cText, true))
+
+        libraryCount = label("", 12, cMuted, false).apply {
+            setPadding(0, dp(2), 0, dp(12))
+        }
+
+        col.addView(libraryCount)
+
+        libraryHolder = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+        }
+
+        col.addView(libraryHolder)
+        scroll.addView(col)
+        return scroll
+    }
+
+    private fun refreshLibrary() {
+        if (!::libraryHolder.isInitialized) return
+
+        io.execute {
+            val items = try {
+                RecordingStore.listItems(this)
+            } catch (_: Exception) {
+                emptyList()
+            }
+
+            runOnUiThread {
+                if (isFinishing) return@runOnUiThread
+                showLibrary(items)
+            }
+        }
+    }
+
+    private fun showLibrary(items: List<RecordingStore.Item>) {
+        libraryHolder.removeAllViews()
+
+        libraryCount.text = when (items.size) {
+            0 -> ""
+            1 -> "1 video"
+            else -> "${items.size} videos"
+        }
+
+        if (items.isEmpty()) {
+            libraryHolder.addView(
+                label(
+                    "No recordings yet.\nYour videos will show up here.",
+                    14,
+                    cMuted,
+                    false
+                ).apply {
+                    gravity = Gravity.CENTER
+                    setPadding(0, dp(60), 0, 0)
+                },
+                LinearLayout.LayoutParams(-1, -2)
+            )
+
+            return
+        }
+
+        val dateFormat = SimpleDateFormat("MMM d, HH:mm", Locale.getDefault())
+
+        for (item in items) {
+            val card = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(dp(12), dp(12), dp(12), dp(6))
+                background = rounded(cCard, 18)
+            }
+
+            val top = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+            }
+
+            val thumb = ImageView(this).apply {
+                scaleType = ImageView.ScaleType.CENTER_CROP
+                background = rounded(cCard2, 12)
+                outlineProvider = ViewOutlineProvider.BACKGROUND
+                clipToOutline = true
+                setOnClickListener { play(item.uri) }
+            }
+
+            top.addView(thumb, LinearLayout.LayoutParams(dp(112), dp(64)))
+            loadThumbnail(thumb, item.uri)
+
+            val texts = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(dp(12), 0, 0, 0)
+            }
+
+            texts.addView(
+                label(item.name.removePrefix("ScreenPro_").removeSuffix(".mp4"), 13, cText, true)
+            )
+
+            texts.addView(
+                label(
+                    RecordingService.formatElapsed(item.durationMs) + "  ·  " +
+                        formatSize(item.sizeBytes) + "  ·  " +
+                        dateFormat.format(Date(item.dateAddedSec * 1000)),
+                    11,
+                    cMuted,
+                    false
+                ).apply { setPadding(0, dp(4), 0, 0) }
+            )
+
+            top.addView(texts, LinearLayout.LayoutParams(0, -2, 1f))
+            card.addView(top)
+
+            val actions = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+            }
+
+            actions.addView(
+                actionText("▶  Play", cText) { play(item.uri) },
+                LinearLayout.LayoutParams(0, -2, 1f)
+            )
+
+            actions.addView(
+                actionText("↗  Share", cText) { share(item.uri) },
+                LinearLayout.LayoutParams(0, -2, 1f)
+            )
+
+            actions.addView(
+                actionText("🗑  Delete", cAccent) { confirmDelete(item) },
+                LinearLayout.LayoutParams(0, -2, 1f)
+            )
+
+            card.addView(actions, LinearLayout.LayoutParams(-1, -2).apply {
+                topMargin = dp(6)
+            })
+
+            libraryHolder.addView(
+                card,
+                LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(12) }
+            )
+        }
+    }
+
+    private fun actionText(text: String, color: Int, onClick: () -> Unit): TextView {
+        return TextView(this).apply {
+            this.text = text
+            textSize = 13f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(color)
+            gravity = Gravity.CENTER
+            setPadding(0, dp(10), 0, dp(10))
+            setOnClickListener { onClick() }
+        }
+    }
+
+    private fun loadThumbnail(view: ImageView, uri: Uri) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return
+
+        io.execute {
+            val bitmap = try {
+                contentResolver.loadThumbnail(uri, Size(360, 200), null)
+            } catch (_: Exception) {
+                null
+            }
+
+            if (bitmap != null) {
+                runOnUiThread { view.setImageBitmap(bitmap) }
+            }
+        }
+    }
+
+    private fun play(uri: Uri) {
+        try {
+            startActivity(
+                Intent(Intent.ACTION_VIEW).apply {
+                    setDataAndType(uri, "video/mp4")
+                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                }
+            )
+        } catch (_: Exception) {
+            toast("No video player found")
+        }
+    }
+
+    private fun share(uri: Uri) {
+        try {
+            val send = Intent(Intent.ACTION_SEND).apply {
+                type = "video/mp4"
+                putExtra(Intent.EXTRA_STREAM, uri)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+
+            startActivity(Intent.createChooser(send, "Share recording"))
+        } catch (_: Exception) {
+            toast("Couldn't share this video")
+        }
+    }
+
+    private fun confirmDelete(item: RecordingStore.Item) {
+        dialog()
+            .setTitle("Delete recording?")
+            .setMessage("This will permanently delete ${item.name}.")
+            .setPositiveButton("Delete") { _, _ -> deleteVideo(item.uri) }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun deleteVideo(uri: Uri) {
+        try {
+            contentResolver.delete(uri, null, null)
+            refreshLibrary()
+        } catch (_: SecurityException) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                try {
+                    pendingDelete = uri
+
+                    val request = MediaStore.createDeleteRequest(
+                        contentResolver,
+                        listOf(uri)
+                    )
+
+                    startIntentSenderForResult(
+                        request.intentSender,
+                        REQ_DELETE,
+                        null,
+                        0,
+                        0,
+                        0
+                    )
+                } catch (e: Exception) {
+                    toast("Couldn't delete this video")
+                }
+            } else {
+                toast("Couldn't delete this video")
+            }
+        } catch (_: Exception) {
+            toast("Couldn't delete this video")
+        }
+    }
+
+    // SETTINGS PAGE
+
+    private fun buildSettingsPage(): View {
+        val scroll = ScrollView(this).apply {
+            overScrollMode = View.OVER_SCROLL_NEVER
+        }
+
+        settingsHolder = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(8), dp(20), dp(24))
+        }
+
+        scroll.addView(settingsHolder)
+        return scroll
+    }
+
+    private fun refreshSettings() {
+        settingsHolder.removeAllViews()
+
+        settingsHolder.addView(sectionTitle("AUDIO"))
+        settingsHolder.addView(
+            card(
+                settingRow("Audio source", audioLabel()) { chooseAudioSource() }
             )
         )
 
-        return card
+        settingsHolder.addView(sectionTitle("VIDEO"))
+        settingsHolder.addView(
+            card(
+                settingRow("Resolution", prefs.getString("resolution", "1080p") ?: "1080p") {
+                    choose(
+                        "Resolution",
+                        listOf("720p", "1080p", "1440p", "Native"),
+                        prefs.getString("resolution", "1080p") ?: "1080p"
+                    ) { prefs.edit().putString("resolution", it).apply() }
+                },
+                divider(),
+                settingRow("Quality", "${prefs.getInt("bitrate_mbps", 8)} Mbps") {
+                    choose(
+                        "Quality (bitrate)",
+                        listOf("4 Mbps", "8 Mbps", "12 Mbps", "16 Mbps"),
+                        "${prefs.getInt("bitrate_mbps", 8)} Mbps"
+                    ) {
+                        prefs.edit().putInt("bitrate_mbps", it.substringBefore(" ").toInt()).apply()
+                    }
+                },
+                divider(),
+                settingRow("Frame rate", "${prefs.getInt("fps", 30)} fps") {
+                    choose(
+                        "Frame rate",
+                        listOf("24 fps", "30 fps", "60 fps"),
+                        "${prefs.getInt("fps", 30)} fps"
+                    ) {
+                        prefs.edit().putInt("fps", it.substringBefore(" ").toInt()).apply()
+                    }
+                }
+            )
+        )
+
+        settingsHolder.addView(sectionTitle("CONTROLS"))
+        settingsHolder.addView(
+            card(
+                switchRow("3-2-1 countdown", "Get ready before recording starts", "countdown_enabled", true),
+                divider(),
+                switchRow("Floating ball", "Timer, pause, screenshot and pen on top of any app", "floating_ball", true),
+                divider(),
+                switchRow("Shake to stop", "Shake your phone to end the recording", "shake_to_stop", false)
+            )
+        )
+
+        settingsHolder.addView(sectionTitle("PERMISSIONS"))
+        settingsHolder.addView(
+            card(
+                settingRow(
+                    "Display over other apps",
+                    if (canOverlay()) "Allowed" else "Tap to allow"
+                ) { openOverlaySettings() }
+            )
+        )
+    }
+
+    private fun card(vararg rows: View): LinearLayout {
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(4), dp(16), dp(4))
+            background = rounded(cCard, 18)
+            rows.forEach { addView(it) }
+        }
+    }
+
+    private fun sectionTitle(text: String): TextView {
+        return label(text, 11, cMuted, true).apply {
+            letterSpacing = 0.12f
+            setPadding(dp(4), dp(18), 0, dp(8))
+        }
+    }
+
+    private fun divider(): View {
+        return View(this).apply {
+            setBackgroundColor(Color.parseColor("#26FFFFFF"))
+            layoutParams = LinearLayout.LayoutParams(-1, dp(1))
+        }
+    }
+
+    private fun settingRow(title: String, value: String, onClick: () -> Unit): View {
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(14), 0, dp(14))
+
+            addView(
+                label(title, 14, cText, false),
+                LinearLayout.LayoutParams(0, -2, 1f)
+            )
+
+            addView(label(value, 14, cOrange, true))
+            setOnClickListener { onClick() }
+        }
     }
 
     private fun switchRow(
@@ -688,289 +909,267 @@ class MainActivity : Activity() {
         key: String,
         default: Boolean
     ): View {
-        val prefs = getSharedPreferences("screenpro", MODE_PRIVATE)
-
         val row = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, dp(8), 0, dp(8))
+            setPadding(0, dp(12), 0, dp(12))
         }
 
         val texts = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
         }
 
-        texts.addView(label(title, 14, 0xFF172033.toInt(), true))
-        texts.addView(label(subtitle, 11, 0xFF7A8497.toInt(), false))
+        texts.addView(label(title, 14, cText, false))
+        texts.addView(label(subtitle, 11, cMuted, false).apply {
+            setPadding(0, dp(2), dp(12), 0)
+        })
 
         row.addView(texts, LinearLayout.LayoutParams(0, -2, 1f))
 
+        val states = arrayOf(
+            intArrayOf(android.R.attr.state_checked),
+            intArrayOf()
+        )
+
         val toggle = Switch(this).apply {
-            isChecked = prefs.getBoolean(key, default)
+            isChecked = isOn(key, default)
+
+            thumbTintList = ColorStateList(
+                states,
+                intArrayOf(cAccent, Color.parseColor("#B0B7C6"))
+            )
+
+            trackTintList = ColorStateList(
+                states,
+                intArrayOf(Color.parseColor("#80FF4D5A"), Color.parseColor("#3A4256"))
+            )
 
             setOnCheckedChangeListener { _, checked ->
                 prefs.edit().putBoolean(key, checked).apply()
+                refreshChips()
             }
         }
 
         row.addView(toggle)
-
         return row
     }
 
-    // MICROPHONE SETTINGS
+    // CHOICES
 
-    private fun showMicrophoneOptions() {
-        val prefs = getSharedPreferences(
-            "screenpro",
-            MODE_PRIVATE
-        )
-
-        val microphoneEnabled = prefs.getBoolean(
-            "microphone_enabled",
-            true
-        )
-
-        AlertDialog.Builder(this)
-            .setTitle("Microphone Audio")
-            .setMessage(
-                "Choose whether ScreenPro should include microphone audio in recordings."
-            )
-            .setSingleChoiceItems(
-                arrayOf(
-                    "Microphone enabled",
-                    "Microphone muted"
-                ),
-                if (microphoneEnabled) 0 else 1
-            ) { dialog, which ->
-
-                prefs.edit()
-                    .putBoolean(
-                        "microphone_enabled",
-                        which == 0
-                    )
-                    .apply()
-
-                Toast.makeText(
-                    this,
-                    if (which == 0) {
-                        "Microphone enabled"
-                    } else {
-                        "Microphone muted"
-                    },
-                    Toast.LENGTH_SHORT
-                ).show()
-
-                dialog.dismiss()
-            }
-            .setNegativeButton("Cancel", null)
-            .show()
+    private fun dialog(): AlertDialog.Builder {
+        return AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
     }
 
-    // VIDEO QUALITY SETTINGS
-
-    private fun showVideoOptions() {
-        val prefs = getSharedPreferences(
-            "screenpro",
-            MODE_PRIVATE
-        )
-
-        val currentQuality = prefs.getString(
-            "video_quality",
-            "HD"
-        ) ?: "HD"
-
-        val options = arrayOf(
-            "Standard (720p)",
-            "HD (1080p)",
-            "High quality (device maximum)"
-        )
-
-        val selected = when (currentQuality) {
-            "Standard" -> 0
-            "Maximum" -> 2
-            else -> 1
-        }
-
-        AlertDialog.Builder(this)
-            .setTitle("Video Quality")
-            .setSingleChoiceItems(
-                options,
-                selected
-            ) { dialog, which ->
-
-                val quality = when (which) {
-                    0 -> "Standard"
-                    2 -> "Maximum"
-                    else -> "HD"
-                }
-
-                prefs.edit()
-                    .putString("video_quality", quality)
-                    .apply()
-
-                Toast.makeText(
-                    this,
-                    "$quality quality selected",
-                    Toast.LENGTH_SHORT
-                ).show()
-
-                dialog.dismiss()
-            }
-            .setNegativeButton("Cancel", null)
-            .show()
-    }
-
-    // APP MENU
-
-    private fun showAppMenu() {
-        val options = arrayOf(
-            "▶   My Recordings",
-            "ⓘ   Recording Guide",
-            "⚙   About ScreenPro"
-        )
-
-        AlertDialog.Builder(this)
-            .setTitle("ScreenPro Menu")
-            .setItems(options) { _, which ->
-                when (which) {
-                    0 -> showRecordings()
-                    1 -> showRecordingGuide()
-                    2 -> showAbout()
-                }
-            }
-            .setNegativeButton("Close", null)
-            .show()
-    }
-
-    private fun showRecordingGuide() {
-        AlertDialog.Builder(this)
-            .setTitle("Recording Guide")
-            .setMessage(
-                "1. Tap Start Recording.\n\n" +
-                "2. Allow microphone access if requested.\n\n" +
-                "3. Confirm Android's screen-capture prompt.\n\n" +
-                "4. Stop the recording when finished.\n\n" +
-                "5. Open My Recordings to play saved videos."
-            )
-            .setPositiveButton("Got it", null)
-            .show()
-    }
-
-    private fun showAbout() {
-        AlertDialog.Builder(this)
-            .setTitle("About ScreenPro")
-            .setMessage(
-                "ScreenPro Recorder\n\n" +
-                "A simple screen recording app for capturing " +
-                "your screen with microphone audio.\n\n" +
-                "Version 1.0"
-            )
-            .setPositiveButton("Close", null)
-            .show()
-    }
-
-    // RECORDINGS COUNT
-
-    private fun updateRecordingCount() {
-        if (!::recordingsCount.isInitialized) return
-
-        val count = try {
-            RecordingStore.list(this).size
-        } catch (_: Exception) {
-            0
-        }
-
-        recordingsCount.text = when (count) {
-            0 -> "No saved videos yet"
-            1 -> "1 saved video"
-            else -> "$count saved videos"
-        }
-    }
-
-    // RECORDING STATE AND TIMER
-
-    private fun setRecording(
-        active: Boolean,
-        paused: Boolean
+    private fun choose(
+        title: String,
+        options: List<String>,
+        current: String,
+        onPick: (String) -> Unit
     ) {
-        val wasRecording = recording
-
-        recording = active
-        recordingPaused = active && paused
-
-        if (!::startButton.isInitialized) return
-
-        startButton.visibility =
-            if (active) View.GONE else View.VISIBLE
-
-        stopButton.visibility =
-            if (active) View.VISIBLE else View.GONE
-
-        if (active) {
-            if (stopRequested) {
-                status.text = "Stopping recording…"
-                readyBadge.text = "SAVING"
-                stopButton.isEnabled = false
-            } else if (paused) {
-                status.text = "Ⅱ Recording paused"
-                readyBadge.text = "PAUSED"
-                stopButton.isEnabled = true
-            } else {
-                status.text = "● Recording in progress"
-                readyBadge.text = "RECORDING"
-                stopButton.isEnabled = true
+        dialog()
+            .setTitle(title)
+            .setSingleChoiceItems(
+                options.toTypedArray(),
+                options.indexOf(current)
+            ) { d, which ->
+                onPick(options[which])
+                d.dismiss()
+                refreshAll()
             }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
 
-            timer.text = RecordingService.formatElapsed(
-                RecordingService.elapsedMs()
-            )
+    private fun chooseAudioSource() {
+        val labels = mutableListOf("Microphone")
+        val values = mutableListOf("mic")
 
-            uiHandler.removeCallbacks(tick)
-            if (!paused) uiHandler.post(tick)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            labels += "Internal audio (game / video sound)"
+            values += "internal"
+            labels += "Microphone + internal audio"
+            values += "both"
+        }
+
+        labels += "No audio"
+        values += "none"
+
+        val current = RecordingService.audioSource(this)
+
+        dialog()
+            .setTitle("Audio source")
+            .setSingleChoiceItems(
+                labels.toTypedArray(),
+                values.indexOf(current)
+            ) { d, which ->
+                prefs.edit().putString("audio_source", values[which]).apply()
+                d.dismiss()
+                refreshAll()
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    // PREF HELPERS
+
+    private fun isOn(key: String, default: Boolean) = prefs.getBoolean(key, default)
+
+    private fun onOff(key: String, default: Boolean) =
+        if (isOn(key, default)) "ON" else "OFF"
+
+    private fun toggle(key: String, default: Boolean) {
+        prefs.edit().putBoolean(key, !isOn(key, default)).apply()
+        refreshAll()
+    }
+
+    private fun audioShort(): String = when (RecordingService.audioSource(this)) {
+        "internal" -> "Internal"
+        "both" -> "Mic + Internal"
+        "none" -> "Off"
+        else -> "Mic"
+    }
+
+    private fun audioLabel(): String = when (RecordingService.audioSource(this)) {
+        "internal" -> "Internal audio"
+        "both" -> "Mic + Internal"
+        "none" -> "No audio"
+        else -> "Microphone"
+    }
+
+    private fun refreshAll() {
+        refreshChips()
+        refreshSettings()
+        render()
+    }
+
+    // STATE RENDERING
+
+    private fun render() {
+        if (!::statusChip.isInitialized) return
+
+        val (text, color) = when {
+            saving -> Pair("SAVING…", cOrange)
+            recording && paused -> Pair("PAUSED", cOrange)
+            recording -> Pair("● RECORDING", cAccent)
+            else -> Pair("READY", Color.parseColor("#30D158"))
+        }
+
+        statusChip.text = text
+        statusChip.setTextColor(color)
+        statusChip.background = GradientDrawable().apply {
+            setColor(Color.argb(38, Color.red(color), Color.green(color), Color.blue(color)))
+            cornerRadius = dp(20).toFloat()
+        }
+
+        subtitleView.text = "🎙 ${audioShort()}  ·  " +
+            "${prefs.getString("resolution", "1080p")}  ·  " +
+            "${prefs.getInt("fps", 30)} fps  ·  " +
+            "${prefs.getInt("bitrate_mbps", 8)} Mbps"
+
+        // Timer
+        ui.removeCallbacks(tick)
+
+        if (recording) {
+            timerView.text = RecordingService.formatElapsed(RecordingService.elapsedMs())
+            if (!paused) ui.post(tick)
         } else {
-            stopRequested = false
-            stopButton.isEnabled = true
+            timerView.text = "00:00"
+        }
 
-            status.text = "Ready when you are"
-            readyBadge.text = "READY"
+        // Record button
+        val inner = recordInner.layoutParams as FrameLayout.LayoutParams
 
-            uiHandler.removeCallbacks(tick)
-            timer.text = "00:00"
+        recordInner.background = GradientDrawable().apply {
+            setColor(Color.WHITE)
 
-            updateRecordingCount()
+            if (recording) {
+                shape = GradientDrawable.RECTANGLE
+                cornerRadius = dp(9).toFloat()
+                inner.width = dp(38)
+                inner.height = dp(38)
+            } else {
+                shape = GradientDrawable.OVAL
+                inner.width = dp(46)
+                inner.height = dp(46)
+            }
+        }
+
+        recordInner.layoutParams = inner
+        recordInner.alpha = if (saving) 0.4f else 1f
+
+        pulse?.cancel()
+        pulse = null
+        recordRing.scaleX = 1f
+        recordRing.scaleY = 1f
+        recordRing.alpha = 0.35f
+
+        if (recording && !paused) {
+            pulse = ObjectAnimator.ofPropertyValuesHolder(
+                recordRing,
+                PropertyValuesHolder.ofFloat("scaleX", 0.85f, 1.25f),
+                PropertyValuesHolder.ofFloat("scaleY", 0.85f, 1.25f),
+                PropertyValuesHolder.ofFloat("alpha", 0.8f, 0f)
+            ).apply {
+                duration = 1400
+                repeatCount = ValueAnimator.INFINITE
+                start()
+            }
+        }
+
+        hintView.text = when {
+            saving -> "Saving your video…"
+            recording -> "Tap to stop"
+            else -> "Tap to start recording"
+        }
+
+        hintView.setPadding(0, dp(4), 0, 0)
+
+        pauseButton.visibility = if (recording && !saving) View.VISIBLE else View.GONE
+        pauseButton.text = if (paused) "▶   Resume" else "❚❚   Pause"
+
+        val needsOverlay =
+            (isOn("floating_ball", true) || isOn("countdown_enabled", true)) &&
+                !canOverlay()
+
+        warnCard.visibility = if (needsOverlay) View.VISIBLE else View.GONE
+    }
+
+    // START / STOP
+
+    private fun onRecordPressed() {
+        when {
+            saving -> toast("Still saving your last recording…")
+            recording -> stopRecording()
+            else -> requestPermissionsAndCapture()
         }
     }
 
-    // PERMISSIONS AND SCREEN CAPTURE
+    private fun stopRecording() {
+        saving = true
+        render()
+
+        startService(
+            Intent(this, RecordingService::class.java).apply {
+                action = RecordingService.ACTION_STOP
+            }
+        )
+    }
 
     private fun requestPermissionsAndCapture() {
-        if (recording || RecordingService.isCountingDown) {
-            Toast.makeText(
-                this,
-                "A recording is already active.",
-                Toast.LENGTH_SHORT
-            ).show()
+        if (recording || saving || RecordingService.isCountingDown) {
+            toast("A recording is already active.")
             return
         }
 
-        val microphoneEnabled = getSharedPreferences(
-            "screenpro",
-            MODE_PRIVATE
-        ).getBoolean("microphone_enabled", true)
+        val needsAudio = RecordingService.audioSource(this) != "none"
 
         if (
-            microphoneEnabled &&
+            needsAudio &&
             checkSelfPermission(Manifest.permission.RECORD_AUDIO) !=
             PackageManager.PERMISSION_GRANTED
         ) {
             pendingStart = true
-
-            requestPermissions(
-                arrayOf(Manifest.permission.RECORD_AUDIO),
-                1002
-            )
-
+            requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), REQ_AUDIO)
             return
         }
 
@@ -981,13 +1180,13 @@ class MainActivity : Activity() {
         ) {
             requestPermissions(
                 arrayOf(Manifest.permission.POST_NOTIFICATIONS),
-                1003
+                REQ_NOTIFICATIONS
             )
         }
 
         startActivityForResult(
             projectionManager.createScreenCaptureIntent(),
-            1001
+            REQ_CAPTURE
         )
     }
 
@@ -996,64 +1195,59 @@ class MainActivity : Activity() {
         permissions: Array<out String>,
         results: IntArray
     ) {
-        super.onRequestPermissionsResult(
-            requestCode,
-            permissions,
-            results
-        )
+        super.onRequestPermissionsResult(requestCode, permissions, results)
 
-        if (requestCode == 1002) {
-            if (
-                results.isNotEmpty() &&
-                results[0] == PackageManager.PERMISSION_GRANTED &&
-                pendingStart
-            ) {
+        if (requestCode == REQ_AUDIO) {
+            val granted = results.isNotEmpty() &&
+                results[0] == PackageManager.PERMISSION_GRANTED
+
+            if (granted && pendingStart) {
                 pendingStart = false
                 requestPermissionsAndCapture()
             } else {
                 pendingStart = false
 
-                Toast.makeText(
-                    this,
-                    "Microphone permission was not granted.",
-                    Toast.LENGTH_LONG
-                ).show()
+                dialog()
+                    .setTitle("Microphone permission needed")
+                    .setMessage(
+                        "Audio recording needs microphone access. You can allow it in " +
+                            "app settings, or record without audio."
+                    )
+                    .setPositiveButton("Open settings") { _, _ ->
+                        startActivity(
+                            Intent(
+                                Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                                Uri.parse("package:$packageName")
+                            )
+                        )
+                    }
+                    .setNeutralButton("Record without audio") { _, _ ->
+                        prefs.edit().putString("audio_source", "none").apply()
+                        refreshAll()
+                    }
+                    .setNegativeButton("Cancel", null)
+                    .show()
             }
         }
     }
 
     @Deprecated("Uses compatible activity result callback")
-    override fun onActivityResult(
-        requestCode: Int,
-        resultCode: Int,
-        data: Intent?
-    ) {
-        super.onActivityResult(
-            requestCode,
-            resultCode,
-            data
-        )
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
 
-        if (requestCode != 1001) return
+        if (requestCode == REQ_DELETE) {
+            if (resultCode == RESULT_OK) refreshLibrary()
+            pendingDelete = null
+            return
+        }
+
+        if (requestCode != REQ_CAPTURE) return
 
         if (resultCode == RESULT_OK && data != null) {
-            stopRequested = false
-
-            val service = Intent(
-                this,
-                RecordingService::class.java
-            ).apply {
+            val service = Intent(this, RecordingService::class.java).apply {
                 action = RecordingService.ACTION_START
-
-                putExtra(
-                    RecordingService.EXTRA_RESULT_CODE,
-                    resultCode
-                )
-
-                putExtra(
-                    RecordingService.EXTRA_RESULT_DATA,
-                    data
-                )
+                putExtra(RecordingService.EXTRA_RESULT_CODE, resultCode)
+                putExtra(RecordingService.EXTRA_RESULT_DATA, data)
             }
 
             try {
@@ -1062,112 +1256,65 @@ class MainActivity : Activity() {
                 } else {
                     startService(service)
                 }
-
-                Toast.makeText(
-                    this,
-                    "ScreenPro is starting…",
-                    Toast.LENGTH_SHORT
-                ).show()
             } catch (e: Exception) {
-                status.text = "Could not start recording."
-
-                Toast.makeText(
-                    this,
-                    "Unable to start the recording service.",
-                    Toast.LENGTH_LONG
-                ).show()
+                e.printStackTrace()
+                toast("Could not start recording")
             }
         } else {
-            status.text = "Screen capture permission was not granted."
+            toast("Screen capture permission was not granted")
         }
     }
 
-    // RECORDINGS LIBRARY
+    // OVERLAY PERMISSION
 
-    private fun showRecordings() {
-        val items = try {
-            RecordingStore.list(this)
-        } catch (_: Exception) {
-            emptyList()
-        }
+    private fun canOverlay(): Boolean =
+        Build.VERSION.SDK_INT < Build.VERSION_CODES.M || Settings.canDrawOverlays(this)
 
-        if (items.isEmpty()) {
-            AlertDialog.Builder(this)
-                .setTitle("No recordings yet")
-                .setMessage(
-                    "Your screen recordings will appear here after you stop a capture."
+    private fun openOverlaySettings() {
+        try {
+            startActivity(
+                Intent(
+                    Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                    Uri.parse("package:$packageName")
                 )
-                .setPositiveButton("OK", null)
-                .show()
-
-            return
+            )
+        } catch (_: Exception) {
+            toast("Open Settings → Apps → ScreenPro → Display over other apps")
         }
-
-        val names = items.mapIndexed { index, uri ->
-            "Recording ${items.size - index}  •  " +
-                (uri.lastPathSegment ?: "Video file")
-        }.toTypedArray()
-
-        AlertDialog.Builder(this)
-            .setTitle("Your recordings")
-            .setItems(names) { _, which ->
-                val play = Intent(Intent.ACTION_VIEW).apply {
-                    setDataAndType(
-                        items[which],
-                        "video/mp4"
-                    )
-
-                    addFlags(
-                        Intent.FLAG_GRANT_READ_URI_PERMISSION
-                    )
-                }
-
-                try {
-                    startActivity(play)
-                } catch (_: Exception) {
-                    Toast.makeText(
-                        this,
-                        "No video player is available.",
-                        Toast.LENGTH_LONG
-                    ).show()
-                }
-            }
-            .setNegativeButton("Close", null)
-            .show()
     }
 
-    // UI HELPERS
+    // SMALL HELPERS
 
-    private fun label(
-        value: String,
-        size: Int,
-        color: Int,
-        bold: Boolean
-    ): TextView {
+    private fun label(text: String, sp: Int, color: Int, bold: Boolean): TextView {
         return TextView(this).apply {
-            text = value
-            textSize = size.toFloat()
+            this.text = text
+            textSize = sp.toFloat()
             setTextColor(color)
-
-            if (bold) {
-                typeface = Typeface.DEFAULT_BOLD
-            }
+            if (bold) typeface = Typeface.DEFAULT_BOLD
         }
     }
 
-    private fun rounded(
-        color: Int,
-        radius: Int
-    ): GradientDrawable {
+    private fun rounded(color: Int, radius: Int): GradientDrawable {
         return GradientDrawable().apply {
             setColor(color)
             cornerRadius = dp(radius).toFloat()
         }
     }
 
-    private fun dp(value: Int): Int {
-        return (
-            value * resources.displayMetrics.density
-        ).toInt()
+    private fun formatSize(bytes: Long): String {
+        val mb = bytes / (1024.0 * 1024.0)
+
+        return if (mb >= 1024) {
+            String.format(Locale.US, "%.1f GB", mb / 1024)
+        } else {
+            String.format(Locale.US, "%.1f MB", mb)
+        }
     }
+
+    private fun toast(message: String) {
+        Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
+    }
+
+    private fun dp(value: Int): Int =
+        (value * resources.displayMetrics.density).toInt()
 }
